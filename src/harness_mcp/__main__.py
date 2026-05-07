@@ -12,10 +12,10 @@ def _run_serve(args: argparse.Namespace) -> int:
     """Boot the FastMCP server with the chosen transport.
 
     FastMCP exposes async transport methods as `run_stdio_async()` and
-    `run_streamable_http_async()` (plus `run_sse_async()` if needed) — the
-    bare `run_stdio` / `run_streamable_http` names are NOT awaitable. Verify
-    the exact method names against the pinned `mcp` version before lock-in;
-    if the SDK rename happens, update both call sites here.
+    `run_streamable_http_async()`. Neither takes positional / keyword
+    arguments; host/port are read from `server.settings`, which is set at
+    `FastMCP(...)` construction time. We mutate it from the CLI args here
+    so `--host` / `--port` flags actually take effect.
     """
     from harness_mcp.server import server  # noqa: PLC0415
 
@@ -23,7 +23,9 @@ def _run_serve(args: argparse.Namespace) -> int:
     if transport == "stdio":
         anyio.run(server.run_stdio_async)
     elif transport == "streamable-http":
-        anyio.run(lambda: server.run_streamable_http_async(host=args.host, port=args.port))
+        server.settings.host = args.host
+        server.settings.port = args.port
+        anyio.run(server.run_streamable_http_async)
     else:
         print(f"unknown transport: {transport}", file=sys.stderr)
         return 1

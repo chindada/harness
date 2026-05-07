@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 
 import anyio
+from claude_agent_sdk import query
+from codex_app_server import AppServerConfig, AsyncCodex, TextInput
 
 from harness_mcp import __version__
 from harness_mcp.config import JobOptions
@@ -35,20 +37,6 @@ from harness_mcp.types import (
 )
 
 logger = logging.getLogger(__name__)
-
-# Lazy SDK imports so unit tests can monkeypatch.
-try:
-    from codex_app_server import (  # type: ignore[import-untyped]
-        AppServerConfig,
-        AsyncCodex,
-        TextInput,
-    )
-except ImportError:  # pragma: no cover
-    AppServerConfig = AsyncCodex = TextInput = None  # type: ignore[assignment]
-try:
-    from claude_agent_sdk import query  # type: ignore[import-untyped]
-except ImportError:  # pragma: no cover
-    query = None  # type: ignore[assignment]
 
 
 class ContractNegotiationFailedError(HarnessToolError):
@@ -108,22 +96,18 @@ async def _drive_codex_round(
     max_turns: int,
 ) -> str:
     """Drive one Codex turn, return the concatenated agent-message-delta body."""
-    cfg = (
-        AppServerConfig(
-            codex_bin=codex_bin,
-            cwd=str(cwd),
-            config_overrides=codex_overrides,
-            client_name="harness-mcp",
-            client_title="Harness Generator",
-            client_version=__version__,
-        )
-        if AppServerConfig is not None
-        else None
+    cfg = AppServerConfig(
+        codex_bin=codex_bin,
+        cwd=str(cwd),
+        config_overrides=codex_overrides,
+        client_name="harness-mcp",
+        client_title="Harness Generator",
+        client_version=__version__,
     )
     events: list[Any] = []
     async with AsyncCodex(config=cfg) as codex:
         thread = await codex.thread_start()
-        turn = await thread.turn(TextInput(user_prompt) if TextInput else user_prompt)
+        turn = await thread.turn(TextInput(user_prompt))
         item_started_count = 0
         async for event in turn.stream():
             events.append(event)
@@ -140,7 +124,7 @@ async def _drive_codex_round(
 async def _drive_claude_round(
     *,
     user_prompt: str,
-    options: Any,  # noqa: ANN401 — SDK options dict; importing the SDK type breaks lazy imports
+    options: Any,  # noqa: ANN401 — SDK options are duck-typed; pinning a type would couple this module to a specific SDK
     max_turns: int,
 ) -> str:
     """Drive one Claude query() to completion (or to max_turns), return concatenated TextBlocks."""

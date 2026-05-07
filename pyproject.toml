@@ -13,7 +13,7 @@ authors = [{ name = "harness-mcp authors" }]
 dependencies = [
   "mcp>=1.12.4",
   "claude-agent-sdk>=0.1.0",
-  "codex-app-server-sdk>=0.3.2",
+  "openai-codex-app-server-sdk @ git+https://github.com/openai/codex.git@main#subdirectory=sdk/python",
   "anyio>=4.5",
   "httpx>=0.27",
   "python-ulid>=3.0",
@@ -24,10 +24,14 @@ dev = [
   "pytest>=8.3",
   "pytest-asyncio>=0.24",
   "ruff>=0.6",
+  "pyright>=1.1.380",
 ]
 
 [project.scripts]
 harness-mcp = "harness_mcp.__main__:main"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/harness_mcp"]
@@ -48,3 +52,10 @@ ignore = ["PLR0913"]  # allow many args on dataclasses / config-shape helpers
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["ANN401", "PLR2004"]
+
+[tool.pyright]
+include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.12"
+typeCheckingMode = "basic"

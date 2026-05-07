@@ -18,13 +18,8 @@ import subprocess
 from pathlib import Path
 from time import monotonic
 
-import anyio
-
-# Imported lazily so unit tests can monkeypatch AsyncCodex without bringing the SDK in.
-try:
-    from codex_app_server import AppServerConfig, AsyncCodex, TextInput
-except ImportError:  # pragma: no cover  — only hit if SDK isn't installed during isolated unit runs
-    AsyncCodex = AppServerConfig = TextInput = None  # type: ignore[assignment]
+from anyio import to_thread
+from codex_app_server import AppServerConfig, AsyncCodex, TextInput
 
 from harness_mcp import __version__
 from harness_mcp.config import JobOptions
@@ -285,7 +280,7 @@ async def commit_and_summarize(
     TagCollisionError so the sprint surfaces `harness_tag_collision`.
     """
     # All git invocations are blocking C calls; offload so the event loop stays free.
-    return await anyio.to_thread.run_sync(
+    return await to_thread.run_sync(
         _commit_and_tag_sync, app_dir, handoff, sprint_seq, job_id
     )
 
@@ -402,17 +397,13 @@ async def chunk_loop(  # noqa: PLR0912, PLR0915, PLR0911 — branching follows t
     while True:
         handoff_path = sprint_dir / f"handoff-{chunk_seq:03d}.md"
 
-        cfg = (
-            AppServerConfig(
-                codex_bin=codex_bin,
-                cwd=str(app_dir),
-                config_overrides=codex_config_overrides,
-                client_name="harness-mcp",
-                client_title="Harness Generator",
-                client_version=__version__,
-            )
-            if AppServerConfig is not None
-            else None
+        cfg = AppServerConfig(
+            codex_bin=codex_bin,
+            cwd=str(app_dir),
+            config_overrides=codex_config_overrides,
+            client_name="harness-mcp",
+            client_title="Harness Generator",
+            client_version=__version__,
         )
 
         event_logger = EventLogger(log_path)
@@ -431,7 +422,7 @@ async def chunk_loop(  # noqa: PLR0912, PLR0915, PLR0911 — branching follows t
                     handoff_path=handoff_path,
                     chunk_seq=chunk_seq,
                 )
-                turn = await thread.turn(TextInput(prompt) if TextInput else prompt)
+                turn = await thread.turn(TextInput(prompt))
 
                 # Spec §7.2:615 — measure wall-clock from event-stream start so
                 # the reset budget covers agentic work, not SDK init / turn setup.

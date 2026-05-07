@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import anyio
+from anyio import to_thread
 
 
 @dataclass
@@ -107,22 +107,22 @@ class EventLogger:
         # Other event types ignored.
 
         if line is not None:
-            await anyio.to_thread.run_sync(self._fh.write, line + "\n")
+            await to_thread.run_sync(self._fh.write, line + "\n")
 
     async def flush(self) -> None:
         """Drain orphan tool-call starts and flush the file handle."""
         for start in list(self._calls.values()):
-            await anyio.to_thread.run_sync(
+            await to_thread.run_sync(
                 self._fh.write,
                 f"[tool: {start.name} args={start.args} -> NO_RESULT]\n",
             )
         self._calls.clear()
-        await anyio.to_thread.run_sync(self._fh.flush)
+        await to_thread.run_sync(self._fh.flush)
 
     async def aclose(self) -> None:
         """Idempotent. Drain orphans, close the file handle."""
         if self._closed:
             return
         await self.flush()
-        await anyio.to_thread.run_sync(self._fh.close)
+        await to_thread.run_sync(self._fh.close)
         self._closed = True

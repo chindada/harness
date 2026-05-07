@@ -24,6 +24,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import anyio
+from anyio import to_thread
 from ulid import ULID
 
 from harness_mcp.config import harness_home, now_ms, state_db_path
@@ -176,7 +177,7 @@ async def db_write(stmt: str, params: tuple) -> None:
         >>> await db_write("UPDATE jobs SET updated_at=? WHERE id=?", (1, "J"))
     """
     async with _writer_lock:
-        await anyio.to_thread.run_sync(_exec_commit, stmt, params)
+        await to_thread.run_sync(_exec_commit, stmt, params)
 
 
 async def db_write_returning_rowcount(stmt: str, params: tuple) -> int:
@@ -201,7 +202,7 @@ async def db_write_returning_rowcount(stmt: str, params: tuple) -> int:
         >>> 0  # cancel beat us
     """
     async with _writer_lock:
-        return await anyio.to_thread.run_sync(_exec_commit, stmt, params)
+        return await to_thread.run_sync(_exec_commit, stmt, params)
 
 
 # ----- Reader connections (per-coroutine) -----

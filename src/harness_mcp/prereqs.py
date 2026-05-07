@@ -24,6 +24,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from codex_app_server import AppServerConfig as _AppServerConfig
+from codex_app_server import AsyncCodex as _AsyncCodex
+from codex_app_server import TextInput as _TextInput
+
 from harness_mcp import __version__
 from harness_mcp.config import harness_home, jobs_root, state_db_path
 from harness_mcp.mcp_capture import (
@@ -31,23 +35,6 @@ from harness_mcp.mcp_capture import (
     parse_user_config_files,
 )
 from harness_mcp.state import init_db, sweep_running_to_interrupted
-
-# Codex SDK is indirected so unit tests can monkeypatch each piece independently.
-# Used in Task 5's probe; importing here keeps all imports at the top to avoid E402.
-try:
-    from codex_app_server import (
-        AppServerConfig as _AppServerConfig,  # type: ignore[import-untyped]
-    )
-    from codex_app_server import (
-        AsyncCodex as _AsyncCodex,  # type: ignore[import-untyped]
-    )
-    from codex_app_server import (
-        TextInput as _TextInput,  # type: ignore[import-untyped]
-    )
-except ImportError:  # pragma: no cover  - only hit when SDK isn't installed
-    _AppServerConfig = None  # type: ignore[assignment]
-    _AsyncCodex = None  # type: ignore[assignment]
-    _TextInput = None  # type: ignore[assignment]
 
 
 class PrereqFailedError(RuntimeError):

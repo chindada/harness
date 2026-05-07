@@ -22,21 +22,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from claude_agent_sdk import query
+
 from harness_mcp.config import JobOptions
 from harness_mcp.types import (
     HarnessToolError,
 )
 
 logger = logging.getLogger(__name__)
-
-# The SDK is imported lazily so unit tests can swap `query` via monkeypatch
-# without making it a hard import (and to keep the module fast to import).
-try:
-    from claude_agent_sdk import (
-        query,  # type: ignore[import-untyped]
-    )
-except ImportError:  # pragma: no cover
-    query = None  # type: ignore[assignment]
 
 # Regex anchors per spec §5.2 / §5.3.
 _SPRINT_RE = re.compile(r"^##\s+Sprint\s+(\d+):\s*(.+?)\s*$", re.MULTILINE)

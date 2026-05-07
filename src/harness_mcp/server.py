@@ -16,9 +16,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-import anyio
+from anyio import create_task_group
+from anyio.abc import TaskGroup
 from mcp import types as mcp_types
 from mcp.server.fastmcp import FastMCP
 
@@ -105,8 +106,8 @@ def _make_planner_options_factory(
         return ClaudeAgentOptions(
             system_prompt=_resolved_prompt_text("planner.md"),
             cwd=str(_kw.get("job_dir", job_dir)),
-            setting_sources=prereqs_result.setting_sources,
-            mcp_servers={"context7": prereqs_result.captured_mcp["context7"]},
+            setting_sources=cast(Any, prereqs_result.setting_sources),
+            mcp_servers=cast(Any, {"context7": prereqs_result.captured_mcp["context7"]}),
             extra_args={"strict-mcp-config": None},
             permission_mode="acceptEdits",
         )
@@ -125,8 +126,8 @@ def _make_reviewer_options_factory(
         return ClaudeAgentOptions(
             system_prompt=_resolved_prompt_text("reviewer.md"),
             cwd=str(_kw.get("job_dir", job_dir)),
-            setting_sources=prereqs_result.setting_sources,
-            mcp_servers={"context7": prereqs_result.captured_mcp["context7"]},
+            setting_sources=cast(Any, prereqs_result.setting_sources),
+            mcp_servers=cast(Any, {"context7": prereqs_result.captured_mcp["context7"]}),
             extra_args={"strict-mcp-config": None},
             permission_mode="acceptEdits",
         )
@@ -153,8 +154,8 @@ def _make_evaluator_options_factory(
         return ClaudeAgentOptions(
             system_prompt=_resolved_prompt_text("evaluator.md"),
             cwd=str(_kw.get("job_dir", job_dir)),
-            setting_sources=prereqs_result.setting_sources,
-            mcp_servers={"context7": prereqs_result.captured_mcp["context7"]},
+            setting_sources=cast(Any, prereqs_result.setting_sources),
+            mcp_servers=cast(Any, {"context7": prereqs_result.captured_mcp["context7"]}),
             extra_args={"strict-mcp-config": None},
             permission_mode="acceptEdits",
         )
@@ -171,8 +172,8 @@ def _make_summarizer_options_factory(prereqs_result: PrereqsResult) -> Callable[
         return ClaudeAgentOptions(
             system_prompt=_resolved_prompt_text("summarizer.md"),
             cwd=str(job_dir),
-            setting_sources=prereqs_result.setting_sources,
-            mcp_servers={"context7": prereqs_result.captured_mcp["context7"]},
+            setting_sources=cast(Any, prereqs_result.setting_sources),
+            mcp_servers=cast(Any, {"context7": prereqs_result.captured_mcp["context7"]}),
             extra_args={"strict-mcp-config": None},
             permission_mode="acceptEdits",
         )
@@ -189,7 +190,7 @@ class ServerState:
 
     prereqs_result: PrereqsResult
     codex_bin: str
-    task_group: anyio.abc.TaskGroup
+    task_group: TaskGroup
 
 
 _state: ServerState | None = None
@@ -218,7 +219,7 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:
         project_root=None,
         report=report,
     )
-    async with anyio.create_task_group() as tg:
+    async with create_task_group() as tg:
         _state = ServerState(prereqs_result=prereqs_result, codex_bin=codex_bin, task_group=tg)
         try:
             yield

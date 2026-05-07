@@ -37,6 +37,7 @@ class TestErrorMapper:
     def test_known_errors_map_to_codes(self, exc: Exception, expected_code: str) -> None:
         result = _to_call_tool_error(exc)
         assert result.isError is True
+        assert result.structuredContent is not None
         # structured_content holds the code under "code".
         assert result.structuredContent["code"] == expected_code
         assert isinstance(result.structuredContent["message"], str)

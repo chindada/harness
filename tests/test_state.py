@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import anyio
@@ -24,7 +25,7 @@ from harness_mcp.state import (
 
 
 @pytest.fixture
-def initialized_home(tmp_harness_home: Path) -> Path:
+def initialized_home(tmp_harness_home: Path) -> Iterator[Path]:
     """tmp_harness_home + state.db opened."""
     init_db()
     yield tmp_harness_home

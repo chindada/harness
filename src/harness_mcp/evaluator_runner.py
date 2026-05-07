@@ -16,9 +16,10 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import anyio
+from anyio import to_thread
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
 from harness_mcp.config import jobs_root  # safe — pure path helper, no DB
@@ -77,9 +78,9 @@ async def _run(payload: dict[str, Any]) -> int:
     captured_mcp = payload.get("captured_mcp_stanzas", {})
     max_eval_seconds = int(payload.get("max_evaluation_seconds", 1800))
 
-    contract_is_file = await anyio.to_thread.run_sync(contract_path.is_file)
+    contract_is_file = await to_thread.run_sync(contract_path.is_file)
     if contract_is_file:
-        contract_text = await anyio.to_thread.run_sync(contract_path.read_text, "utf-8")
+        contract_text = await to_thread.run_sync(contract_path.read_text, "utf-8")
     else:
         contract_text = ""
     prior_tag = payload.get("prior_tag")  # str | None
@@ -87,8 +88,8 @@ async def _run(payload: dict[str, Any]) -> int:
     options = ClaudeAgentOptions(
         system_prompt=_resolved_prompt_text("evaluator.md"),
         cwd=str(job_dir),
-        setting_sources=setting_sources,
-        mcp_servers={name: dict(stanza) for name, stanza in captured_mcp.items()},
+        setting_sources=cast(Any, setting_sources),
+        mcp_servers=cast(Any, {name: dict(stanza) for name, stanza in captured_mcp.items()}),
         extra_args={"strict-mcp-config": None},
         permission_mode="bypassPermissions",
     )

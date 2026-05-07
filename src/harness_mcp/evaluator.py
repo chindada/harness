@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 import anyio
+from anyio import to_thread
 
 from harness_mcp.types import (
     Criterion,
@@ -145,12 +146,12 @@ def _fsync_dir(d: Path) -> None:
 
 async def sync_eval_md(path: Path, *, expect_section: str) -> None:
     """Wait for SDK file writes to land; assert the expected section is present."""
-    await anyio.to_thread.run_sync(_fsync_dir, path.parent)
+    await to_thread.run_sync(_fsync_dir, path.parent)
     await anyio.sleep(0.1)
-    is_file = await anyio.to_thread.run_sync(path.is_file)
+    is_file = await to_thread.run_sync(path.is_file)
     if not is_file:
         raise EvaluatorEmittedUnparseableEvalMdError(f"eval.md missing after query: {path}")
-    text = await anyio.to_thread.run_sync(path.read_text, "utf-8")
+    text = await to_thread.run_sync(path.read_text, "utf-8")
     if expect_section not in text:
         raise EvaluatorEmittedUnparseableEvalMdError(
             f"expected section {expect_section!r} missing in {path}"
@@ -242,4 +243,4 @@ async def pipe_claude_msg_to_log(msg: Any, log_path: Path) -> None:  # noqa: ANN
         with open(log_path, "a", encoding="utf-8", buffering=1) as fh:
             fh.write(payload)
 
-    await anyio.to_thread.run_sync(_write)
+    await to_thread.run_sync(_write)

@@ -14,11 +14,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-try:
-    from claude_agent_sdk import query  # type: ignore[import-untyped]
-except ImportError:  # pragma: no cover
-    query = None  # type: ignore[assignment]
-
+from claude_agent_sdk import query
 
 _SPRINT_DIR_RE = re.compile(r"^sprint-(\d+)$")
 

@@ -824,13 +824,15 @@ class TestChunkLoop:
         sprint_dir.mkdir()
         (sprint_dir / "contract.md").write_text("CONTRACT")
 
-        # Fake monotonic clock the chunk_loop sees. Each call advances 0.5s.
-        # codex_reset_minutes=0.01 -> 0.6 seconds. Two clock advances put
-        # us past the threshold.
+        # Fake monotonic clock the chunk_loop sees. Each call advances 31s.
+        # codex_reset_minutes=1 -> 60-second threshold. The first call
+        # captures `chunk_started`; the next __anext__ ticks +31s (delta=31s,
+        # below threshold), the one after that ticks +31s more (delta=62s,
+        # past threshold) and triggers the break.
         clock_now = [1000.0]
 
         def fake_monotonic() -> float:
-            clock_now[0] += 0.5
+            clock_now[0] += 31.0
             return clock_now[0]
 
         monkeypatch.setattr(gen_mod, "monotonic", fake_monotonic)
@@ -869,13 +871,13 @@ class TestChunkLoop:
 
         monkeypatch.setattr(gen_mod, "AsyncCodex", fake_async_codex)
 
-        # reset_minutes=0.01 → 0.6s threshold. Each fake_monotonic() call
-        # advances by 0.5s. The first call is for `chunk_started = monotonic()`
-        # outside the loop (at t=1000.5). Inside the per-event branch it ticks
-        # to 1001.0 (delta=0.5; below threshold), then 1001.5 (delta=1.0; above).
-        # So the second event triggers the break.
+        # reset_minutes=1 → 60s threshold. Each fake_monotonic() call
+        # advances by 31s. The first call captures chunk_started at t=1031.0;
+        # the next event ticks to 1062.0 (delta=31s, below threshold), and the
+        # one after that ticks to 1093.0 (delta=62s, above). So the second
+        # event after chunk_started triggers the break.
         opts = JobOptions(
-            codex_reset_steps=99999, codex_reset_minutes=0.01, max_codex_chunks_per_sprint=2
+            codex_reset_steps=99999, codex_reset_minutes=1, max_codex_chunks_per_sprint=2
         )
         await chunk_loop(
             app_dir=app_repo,
@@ -891,7 +893,7 @@ class TestChunkLoop:
             eval_md_for_retry=None,
         )
         # Each chunk yields 2 events before the wall-clock branch triggers
-        # the break (event 2 sees delta >= 1.0s > 0.6s threshold).
+        # the break (event 2 sees delta >= 62s > 60s threshold).
         assert per_chunk_yields == [2, 2], (
             f"expected 2 yields per chunk (wall-clock break at event 2), got {per_chunk_yields}"
         )
