@@ -1,9 +1,13 @@
 """Evaluator helpers: eval.md parsing, sync helper, prompt builders, log piping.
 
-The Evaluator phase has three modes (contract review, static audit,
-dynamic verification). The launcher subprocess (evaluator_runner.py)
-imports these helpers and drives `ClaudeSDKClient`. The orchestrator
-imports `parse_eval_md` to digest the result.
+The launcher subprocess (evaluator_runner.py) drives the §8.2/§8.3
+modes — static audit and dynamic verification — using these helpers
+plus `ClaudeSDKClient`. (Contract-review mode is the Evaluator's role
+during §6.1 sprint negotiation, but that path runs in-process via
+`sprints.negotiate_contract` against `claude_agent_sdk.query()`, not
+through this launcher; it does not consume `parse_eval_md` and never
+writes `eval.md`.) The orchestrator imports `parse_eval_md` to digest
+the launcher's eval.md output.
 
 The static / dynamic prompt builders live here so the launcher and any
 orchestrator-side debugging can call the same functions.

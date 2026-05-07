@@ -51,6 +51,16 @@ class CommitFailedError(Exception):
     """Raised by commit_and_summarize when git operations fail."""
 
 
+class TagCollisionError(Exception):
+    """Raised by commit_and_summarize when an annotated tag with the target
+    name already exists outside this job's `harness/<job_id>/` namespace.
+
+    Spec §6.4 narrows tag overwrite to same-job retries; user-curated or
+    other-job tags must be preserved. The orchestrator surfaces this as
+    `error_text="harness_tag_collision"` verbatim.
+    """
+
+
 class EvaluatorEmittedUnparseableEvalMdError(Exception):
     """Raised when eval.md contains zero parseable Criterion blocks."""
 
@@ -91,6 +101,11 @@ class EvaluationResult:
     `passed` is the AND of all PASS results across both criterion lists.
     `unparseable=True` means the file existed but had zero parseable
     Criterion blocks; the orchestrator treats this as a sprint failure.
+
+    `launcher_stderr_tail` is the last 4KB of the launcher subprocess's
+    stderr (per spec §8.4:1023-1035), populated only when the launcher
+    exited non-zero so the operator sees diagnostic context in the
+    terminal `error_text`.
     """
 
     sprint_seq: int
@@ -99,6 +114,7 @@ class EvaluationResult:
     routing_decision: str
     passed: bool
     unparseable: bool = False
+    launcher_stderr_tail: str = ""
 
 
 @dataclass(frozen=True)

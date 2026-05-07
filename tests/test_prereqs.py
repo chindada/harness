@@ -86,6 +86,43 @@ class TestCheckCodexBinary:
         with pytest.raises(PrereqFailedError):
             check_codex_binary()
 
+    def test_warns_when_config_toml_missing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Spec §10.1.2a:1125 — `~/.codex/config.toml` is read warn-only;
+        missing file appends a warning to the success message but doesn't
+        fail the check."""
+        # Point HOME at an empty tmp dir so ~/.codex/config.toml is absent.
+        monkeypatch.setenv("HOME", str(tmp_path / "nohome"))
+        # Fake a working codex binary.
+        fake_bin = tmp_path / "fake_codex.sh"
+        fake_bin.write_text("#!/bin/sh\necho 'codex 0.1.0'\n")
+        fake_bin.chmod(0o755)
+        monkeypatch.setenv("HARNESS_CODEX_BIN", str(fake_bin))
+
+        msg = check_codex_binary()
+        assert msg.startswith("OK codex:")
+        assert "config.toml" in msg
+        assert "warning" in msg.lower()
+
+    def test_no_warning_when_config_toml_present(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """When ~/.codex/config.toml exists, the success message has no warning."""
+        home = tmp_path / "home"
+        (home / ".codex").mkdir(parents=True)
+        (home / ".codex" / "config.toml").write_text('model = "gpt-4o"\n')
+        monkeypatch.setenv("HOME", str(home))
+
+        fake_bin = tmp_path / "fake_codex.sh"
+        fake_bin.write_text("#!/bin/sh\necho 'codex 0.1.0'\n")
+        fake_bin.chmod(0o755)
+        monkeypatch.setenv("HARNESS_CODEX_BIN", str(fake_bin))
+
+        msg = check_codex_binary()
+        assert msg.startswith("OK codex:")
+        assert "warning" not in msg.lower()
+
 
 class TestSweepAtStartup:
     @pytest.mark.asyncio

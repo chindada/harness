@@ -14,6 +14,7 @@ import pytest
 from harness_mcp import planning as _planning_module
 from harness_mcp.config import JobOptions
 from harness_mcp.planning import (
+    PlanPhaseFailed,
     extract_sprints,
     parse_review,
     run_plan_phase,
@@ -350,3 +351,178 @@ class TestRunPlanPhase:
             )
             assert rounds == 1
             assert (job_dir / "plan.md").is_file()
+
+    @pytest.mark.asyncio
+    async def test_phase_setter_called_at_each_transition(self, tmp_path: Path) -> None:
+        """Spec §4.4: phase_setter receives every plan-phase transition so
+        poll_build reflects the live state. Sequence on one revision:
+        plan-review (after v1) → plan-revision (entering v2) → plan-review (v2)."""
+        job_dir = tmp_path / "job"
+        job_dir.mkdir()
+        (job_dir / "design.md").write_text("DESIGN")
+        (job_dir / "plan-history").mkdir()
+
+        phase_log: list[str] = []
+
+        async def capture(phase: str) -> None:
+            phase_log.append(phase)
+
+        def write_v1() -> None:
+            (job_dir / "plan-history" / "plan-v1.md").write_text(SAMPLE_PLAN)
+
+        def write_review_issues() -> None:
+            (job_dir / "plan-history" / "review-v1.md").write_text(SAMPLE_REVIEW_ISSUES_FOUND)
+
+        def write_v2() -> None:
+            (job_dir / "plan-history" / "plan-v2.md").write_text(SAMPLE_PLAN)
+
+        def write_review_approved() -> None:
+            (job_dir / "plan-history" / "review-v2.md").write_text(SAMPLE_REVIEW_APPROVED)
+
+        scripts = [
+            (write_v1, [_make_assistant_with_skill_call(), _make_result_msg()]),
+            (write_review_issues, [_make_result_msg()]),
+            (write_v2, [_make_assistant_with_skill_call(), _make_result_msg()]),
+            (write_review_approved, [_make_result_msg()]),
+        ]
+
+        with patched_query(scripts):
+            await run_plan_phase(
+                job_dir=job_dir,
+                options=JobOptions(),
+                planner_options_factory=lambda **_kw: object(),
+                reviewer_options_factory=lambda **_kw: object(),
+                phase_setter=capture,
+            )
+        assert phase_log == ["plan-review", "plan-revision", "plan-review"]
+
+    @pytest.mark.asyncio
+    async def test_cap_exhaustion_phase_and_issues_in_error_text(
+        self, tmp_path: Path
+    ) -> None:
+        """Spec §5.2:343 — at cap, raise PlanPhaseFailed with phase=plan-review
+        and error_text listing the unresolved [implementation] issues (so the
+        operator sees what blocked approval, not a bare 'cap exceeded')."""
+        job_dir = tmp_path / "job"
+        job_dir.mkdir()
+        (job_dir / "design.md").write_text("DESIGN")
+        (job_dir / "plan-history").mkdir()
+
+        def write_v1() -> None:
+            (job_dir / "plan-history" / "plan-v1.md").write_text(SAMPLE_PLAN)
+
+        def write_review_issues_v1() -> None:
+            (job_dir / "plan-history" / "review-v1.md").write_text(SAMPLE_REVIEW_ISSUES_FOUND)
+
+        def write_v2() -> None:
+            (job_dir / "plan-history" / "plan-v2.md").write_text(SAMPLE_PLAN)
+
+        def write_review_issues_v2() -> None:
+            (job_dir / "plan-history" / "review-v2.md").write_text(SAMPLE_REVIEW_ISSUES_FOUND)
+
+        scripts = [
+            (write_v1, [_make_assistant_with_skill_call(), _make_result_msg()]),
+            (write_review_issues_v1, [_make_result_msg()]),
+            (write_v2, [_make_assistant_with_skill_call(), _make_result_msg()]),
+            (write_review_issues_v2, [_make_result_msg()]),
+        ]
+
+        # cap=1 — first review's issues count as round 1, second review trips it.
+        opts = JobOptions(max_plan_review_rounds=1)
+        with patched_query(scripts), pytest.raises(PlanPhaseFailed) as exc_info:
+            await run_plan_phase(
+                job_dir=job_dir,
+                options=opts,
+                planner_options_factory=lambda **_kw: object(),
+                reviewer_options_factory=lambda **_kw: object(),
+            )
+        assert exc_info.value.phase == "plan-review"
+        assert "max_plan_review_rounds_exceeded" in exc_info.value.error_text
+        assert "missing actual SQL schema" in exc_info.value.error_text
+        assert "no test plan" in exc_info.value.error_text
+
+    @pytest.mark.asyncio
+    async def test_max_sprints_oversize_skips_reviewer_and_revises(
+        self, tmp_path: Path
+    ) -> None:
+        """Spec §5.2:328 — when a plan has more sprints than `max_sprints`,
+        skip the Reviewer round entirely and inject a synthetic
+        `[implementation]` issue into the next Planner revision."""
+        job_dir = tmp_path / "job"
+        job_dir.mkdir()
+        (job_dir / "design.md").write_text("DESIGN")
+        (job_dir / "plan-history").mkdir()
+
+        # v1 has 3 sprints (exceeds max_sprints=2), v2 has 2 sprints (within cap).
+        oversized = dedent(
+            """
+            # Plan
+            ## Sprint 1: A
+            ## Sprint 2: B
+            ## Sprint 3: C
+            """
+        ).strip()
+        within_cap = dedent(
+            """
+            # Plan
+            ## Sprint 1: AB
+            ## Sprint 2: C
+            """
+        ).strip()
+
+        def write_v1() -> None:
+            (job_dir / "plan-history" / "plan-v1.md").write_text(oversized)
+
+        def write_v2() -> None:
+            (job_dir / "plan-history" / "plan-v2.md").write_text(within_cap)
+
+        def write_review_v2() -> None:
+            (job_dir / "plan-history" / "review-v2.md").write_text(SAMPLE_REVIEW_APPROVED)
+
+        scripts = [
+            (write_v1, [_make_assistant_with_skill_call(), _make_result_msg()]),
+            # NOTE: no review-v1 script — the loop must skip the Reviewer.
+            (write_v2, [_make_assistant_with_skill_call(), _make_result_msg()]),
+            (write_review_v2, [_make_result_msg()]),
+        ]
+
+        opts = JobOptions(max_sprints=2)
+        with patched_query(scripts):
+            sprints, rounds = await run_plan_phase(
+                job_dir=job_dir,
+                options=opts,
+                planner_options_factory=lambda **_kw: object(),
+                reviewer_options_factory=lambda **_kw: object(),
+            )
+        assert len(sprints) == 2
+        assert rounds == 1  # one revision driven by the synthetic issue
+        # review-v1.md should NOT exist (Reviewer skipped on oversized plan).
+        assert not (job_dir / "plan-history" / "review-v1.md").is_file()
+
+    @pytest.mark.asyncio
+    async def test_unstructured_v1_after_retry_phase_planning(self, tmp_path: Path) -> None:
+        """Spec §5.1:320 — initial plan-v1 unstructured after retry → phase=planning."""
+        job_dir = tmp_path / "job"
+        job_dir.mkdir()
+        (job_dir / "design.md").write_text("DESIGN")
+        (job_dir / "plan-history").mkdir()
+
+        def write_unstructured() -> None:
+            (job_dir / "plan-history" / "plan-v1.md").write_text(
+                "# No sprints here\n\nfree-form.\n"
+            )
+
+        scripts = [
+            (write_unstructured, [_make_assistant_with_skill_call(), _make_result_msg()]),
+            (write_unstructured, [_make_result_msg()]),  # retry leaves it unstructured
+        ]
+
+        with patched_query(scripts), pytest.raises(PlanPhaseFailed) as exc_info:
+            await run_plan_phase(
+                job_dir=job_dir,
+                options=JobOptions(),
+                planner_options_factory=lambda **_kw: object(),
+                reviewer_options_factory=lambda **_kw: object(),
+            )
+        assert exc_info.value.phase == "planning"
+        assert exc_info.value.error_text == "planner_emitted_unstructured_plan_after_retry"

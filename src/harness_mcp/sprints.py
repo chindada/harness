@@ -5,11 +5,12 @@ Stage 1 here. Stages 2-4 added in Tasks 2-3.
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -280,6 +281,7 @@ async def run_evaluation(
     setting_sources: list[str],
     options: JobOptions,
     prior_tag: str | None,
+    phase_setter: Callable[[str], Awaitable[None]] | None = None,
 ) -> EvaluationResult:
     """Spawn the launcher subprocess under ProcessGroupScope; parse eval.md.
 
@@ -311,6 +313,10 @@ async def run_evaluation(
     payload_bytes = json.dumps(payload).encode("utf-8")
 
     rc = 0
+    # Spec §8.4:1023-1035 — bounded deque keeps the last 4KB of launcher
+    # stderr so a non-zero exit can be surfaced with diagnostic context
+    # (Claude SDK traces, deprecation warnings) instead of an opaque rc.
+    stderr_tail: collections.deque[int] = collections.deque(maxlen=4096)
     async with ProcessGroupScope(f"eval-{job_id}-{sprint_seq}") as pg:
         proc = await pg.spawn(
             _launcher_command(),
@@ -331,11 +337,40 @@ async def run_evaluation(
             except Exception:
                 return
 
+        async def _drain_stderr_with_phase(stream: Any) -> None:  # noqa: ANN401
+            # Spec §4.4:280 — launcher emits `PHASE:<name>` lines on stderr at
+            # internal phase transitions (currently just `eval-dynamic`).
+            # Capture them so poll_build mirrors the live phase. Also feed
+            # raw bytes into stderr_tail (§8.4:1023-1035).
+            if stream is None:
+                return
+            buf = b""
+            try:
+                async for chunk in stream:
+                    stderr_tail.extend(chunk)
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, _, buf = buf.partition(b"\n")
+                        text = line.decode("utf-8", errors="replace").strip()
+                        if not text.startswith("PHASE:"):
+                            continue
+                        if phase_setter is None:
+                            continue
+                        marker = text.split(":", 1)[1].strip()
+                        if marker == "eval-dynamic":
+                            await phase_setter(f"sprint-{sprint_seq}/eval-dynamic")
+            except (anyio.EndOfStream, anyio.ClosedResourceError):
+                return
+            except Exception:
+                return
+
         async with anyio.create_task_group() as tg:
             tg.start_soon(_drain, proc.stdout)
-            tg.start_soon(_drain, proc.stderr)
+            tg.start_soon(_drain_stderr_with_phase, proc.stderr)
             with anyio.fail_after(options.max_evaluation_seconds + 60):
                 rc = await proc.wait()
+
+    tail_text = bytes(stderr_tail).decode("utf-8", errors="replace") if rc != 0 else ""
 
     try:
         result = parse_eval_md(eval_path, sprint_seq=sprint_seq)
@@ -347,6 +382,7 @@ async def run_evaluation(
             routing_decision="",
             passed=False,
             unparseable=True,
+            launcher_stderr_tail=tail_text,
         )
     if rc != 0 and result.passed:
         # Launcher errored even though eval.md parsed clean — distrust.
@@ -357,6 +393,7 @@ async def run_evaluation(
             routing_decision=result.routing_decision,
             passed=False,
             unparseable=True,
+            launcher_stderr_tail=tail_text,
         )
     return result
 
@@ -383,7 +420,7 @@ def _slice_plan_section(plan_text: str, sprint_seq: int) -> str:
     return ""
 
 
-async def run_sprint(
+async def run_sprint(  # noqa: PLR0915 — sprint state machine has many branches
     *,
     job_id: str,
     sprint_seq: int,
@@ -397,8 +434,14 @@ async def run_sprint(
     codex_bin: str,
     codex_overrides: tuple[str, ...],
     prior_tag: str | None,
+    phase_setter: Callable[[str], Awaitable[None]] | None = None,
 ) -> SprintResult:
-    """Run one sprint end-to-end: contract -> impl -> eval -> retry."""
+    """Run one sprint end-to-end: contract -> impl -> eval -> retry.
+
+    `phase_setter` (if provided) is awaited at every spec §4.4 sprint-phase
+    transition: contract→implementing (sealed), implementing→eval-static
+    (handoff done), eval-static→eval-dynamic (launcher stderr marker).
+    """
     sprint_dir = job_dir / f"sprint-{sprint_seq}"
     sprint_dir.mkdir(parents=True, exist_ok=True)
     contract_path = sprint_dir / "contract.md"
@@ -422,34 +465,52 @@ async def run_sprint(
     plan_section_file = sprint_dir / "plan_section.md"
     plan_section_file.write_text(plan_section_text, encoding="utf-8")
 
+    async def _set_phase(phase: str) -> None:
+        if phase_setter is not None:
+            await phase_setter(phase)
+
     attempts = 0
+    sealed = False
     eval_md_for_retry: Path | None = None
+    last_error: str | None = None
+    last_unparseable = False
+    last_stderr_tail = ""
 
     while attempts <= options.max_sprint_retries:
         attempts += 1
         try:
             with anyio.fail_after(options.max_sprint_duration_minutes * 60):
-                if attempts == 1:
-                    sealed = await negotiate_contract(
-                        job_dir=job_dir,
-                        sprint_dir=sprint_dir,
-                        sprint_seq=sprint_seq,
-                        sprint_title=sprint_title,
-                        design_text=design_text,
-                        plan_section_text=plan_section_text,
-                        options=options,
-                        generator_md=generator_md,
-                        evaluator_options_factory=evaluator_options_factory,
-                        codex_bin=codex_bin,
-                        codex_overrides=codex_overrides,
+                if not sealed:
+                    # Spec §6.1:404,408 — both-empty-bodies and cap-exhausted
+                    # non-convergence each count as one sprint retry; the next
+                    # attempt restarts negotiation with a fresh contract.md.
+                    contract_path.write_text(
+                        f"# Sprint {sprint_seq}: {sprint_title}\n", encoding="utf-8"
                     )
-                    if not sealed:
-                        return SprintResult(
+                    try:
+                        sealed = await negotiate_contract(
+                            job_dir=job_dir,
+                            sprint_dir=sprint_dir,
                             sprint_seq=sprint_seq,
-                            passed=False,
-                            attempts=attempts,
-                            error="contract_not_sealed",
+                            sprint_title=sprint_title,
+                            design_text=design_text,
+                            plan_section_text=plan_section_text,
+                            options=options,
+                            generator_md=generator_md,
+                            evaluator_options_factory=evaluator_options_factory,
+                            codex_bin=codex_bin,
+                            codex_overrides=codex_overrides,
                         )
+                    except ContractNegotiationFailedError as ce:
+                        last_error = "contract_negotiation_no_progress"
+                        sealed = False
+                        _ = ce  # message logged inside negotiate_contract
+                    if not sealed:
+                        last_error = last_error or "contract_not_sealed"
+                        continue  # next sprint retry restarts negotiation
+
+                # Contract sealed. Spec §4.4:278.
+                await _set_phase(f"sprint-{sprint_seq}/implementing")
 
                 impl_result = await chunk_loop(
                     app_dir=job_dir / "app",
@@ -474,6 +535,9 @@ async def run_sprint(
                         error=impl_result.error or "implementation_failed",
                     )
 
+                # Handoff said done & commit/tag succeeded. Spec §4.4:279.
+                await _set_phase(f"sprint-{sprint_seq}/eval-static")
+
                 eval_result = await run_evaluation(
                     job_id=job_id,
                     sprint_seq=sprint_seq,
@@ -483,10 +547,15 @@ async def run_sprint(
                     setting_sources=setting_sources,
                     options=options,
                     prior_tag=prior_tag,
+                    phase_setter=phase_setter,
                 )
                 if eval_result.passed:
                     return SprintResult(sprint_seq=sprint_seq, passed=True, attempts=attempts)
                 # Failed eval -> retry path uses this eval.md as input.
+                # Track unparseable so the terminal SprintResult surfaces the
+                # spec'd error_text per §6.3:516 instead of a generic message.
+                last_unparseable = eval_result.unparseable
+                last_stderr_tail = eval_result.launcher_stderr_tail
                 eval_md_for_retry = sprint_dir / "eval.md"
         except TimeoutError:
             return SprintResult(
@@ -496,9 +565,17 @@ async def run_sprint(
                 error="sprint_timeout",
             )
 
+    if last_unparseable:
+        terminal_error = "evaluator_emitted_unparseable_eval_md"
+        if last_stderr_tail:
+            # Spec §8.4:1023 — launcher stderr tail surfaces in error_text on
+            # non-zero exit so the operator can see what crashed.
+            terminal_error = f"{terminal_error}: {last_stderr_tail.strip()}"
+    else:
+        terminal_error = last_error or "max_sprint_retries_exceeded"
     return SprintResult(
         sprint_seq=sprint_seq,
         passed=False,
         attempts=attempts,
-        error="max_sprint_retries_exceeded",
+        error=terminal_error,
     )

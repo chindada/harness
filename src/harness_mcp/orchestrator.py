@@ -21,7 +21,7 @@ from typing import Any
 import anyio
 
 from harness_mcp.config import JobOptions, jobs_root, now_ms
-from harness_mcp.planning import run_plan_phase
+from harness_mcp.planning import PlanPhaseFailed, run_plan_phase
 from harness_mcp.prereqs import PrereqsResult
 from harness_mcp.prompts_loader import _resolved_prompt_text
 from harness_mcp.sprints import run_sprint
@@ -168,12 +168,22 @@ async def run_job(
 
             # Plan phase.
             generator_md = _resolved_prompt_text("generator.md")
+
+            async def _set_plan_phase(phase: str) -> None:
+                # Spec §4.4: every plan-phase transition mirrors into the jobs
+                # row so poll_build reports the live phase.
+                await db_write(
+                    "UPDATE jobs SET current_phase=?, updated_at=? WHERE id=?",
+                    (phase, now_ms(), job_id),
+                )
+
             sprints, plan_review_rounds = await run_plan_phase(
                 job_dir=job_dir,
                 options=options,
                 planner_options_factory=planner_options_factory,
                 reviewer_options_factory=reviewer_options_factory,
                 log_path=log_path,
+                phase_setter=_set_plan_phase,
             )
 
             # Spec §5.2 / §6.6: persist the review-round count so poll_build
@@ -202,6 +212,13 @@ async def run_job(
                     (now_ms(), job_id, seq),
                 )
 
+                async def _set_sprint_phase(phase: str) -> None:
+                    # Spec §4.4:277-280 — sprint sub-phase transitions.
+                    await db_write(
+                        "UPDATE jobs SET current_phase=?, updated_at=? WHERE id=?",
+                        (phase, now_ms(), job_id),
+                    )
+
                 result = await run_sprint(
                     job_id=job_id,
                     sprint_seq=seq,
@@ -215,6 +232,7 @@ async def run_job(
                     codex_bin=codex_bin,
                     codex_overrides=prereqs_result.codex_overrides,
                     prior_tag=prior_tag,
+                    phase_setter=_set_sprint_phase,
                 )
 
                 final_status = "passed" if result.passed else "failed"
@@ -264,6 +282,18 @@ async def run_job(
                     (now_ms(), job_id),
                 )
             raise
+        except PlanPhaseFailed as e:
+            # Spec §5.1:320 / §5.2:327 / §5.2:343 — fail with the phase the
+            # planning layer reports (`planning` | `plan-revision` |
+            # `plan-review`) and the human-readable error_text it composed,
+            # rather than the generic `orchestrator_error: …` envelope.
+            with anyio.CancelScope(shield=True), anyio.move_on_after(15):
+                await db_write(
+                    "UPDATE jobs SET status='failed', current_phase=?, error_text=?, "
+                    "finished_at=?, updated_at=? WHERE id=? AND status NOT IN "
+                    "('completed','failed','cancelled','interrupted')",
+                    (e.phase, e.error_text, now_ms(), now_ms(), job_id),
+                )
         except Exception as e:
             with anyio.CancelScope(shield=True), anyio.move_on_after(15):
                 await db_write(

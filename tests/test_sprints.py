@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import anyio
 import pytest
 
 from harness_mcp import sprints
@@ -312,6 +313,61 @@ class TestRunEvaluation:
         assert isinstance(result, EvaluationResult)
         assert result.passed is True
 
+    @pytest.mark.asyncio
+    async def test_phase_dynamic_marker_drives_phase_setter(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec §4.4:280 — launcher emits `PHASE:eval-dynamic` on stderr after
+        the static section is written; orchestrator captures it via the stderr
+        drain and flips current_phase to `sprint-<N>/eval-dynamic`."""
+        # Stub launcher: writes a valid eval.md AND emits the phase marker on stderr.
+        stub = tmp_path / "stub_runner.py"
+        stub.write_text(
+            textwrap.dedent(
+                """
+                import json, sys, pathlib
+                payload = json.loads(sys.stdin.read())
+                ep = pathlib.Path(payload["paths"]["eval"])
+                ep.parent.mkdir(parents=True, exist_ok=True)
+                ep.write_text(
+                    "# Sprint 1 Evaluation\\n"
+                    "## Static audit\\n\\n### Criterion 1: x\\n"
+                    "**Result:** PASS\\n**Evidence:** e\\n**Notes:** n\\n"
+                    "## Dynamic verification\\n\\n### Routing decision\\nran tests\\n\\n"
+                    "### Criterion 1: y\\n**Result:** PASS\\n**Evidence:** e\\n**Notes:** n\\n"
+                )
+                # Emit the phase marker mid-run (after static, before dynamic).
+                print("PHASE:eval-dynamic", file=sys.stderr, flush=True)
+                """
+            ).strip()
+        )
+        monkeypatch.setattr(sprints, "_launcher_command", lambda: [sys.executable, str(stub)])
+
+        job_id = "JOBID"
+        job_dir = tmp_path / "jobs" / job_id
+        sprint_dir = job_dir / "sprint-1"
+        sprint_dir.mkdir(parents=True)
+        (sprint_dir / "contract.md").write_text("# Sprint 1\n", encoding="utf-8")
+
+        captured: list[str] = []
+
+        async def capture(p: str) -> None:
+            captured.append(p)
+
+        result = await run_evaluation(
+            job_id=job_id,
+            sprint_seq=1,
+            sprint_dir=sprint_dir,
+            job_dir=job_dir,
+            captured_mcp={"context7": {"command": "ctx7"}},
+            setting_sources=["user"],
+            options=JobOptions(max_evaluation_seconds=30),
+            prior_tag=None,
+            phase_setter=capture,
+        )
+        assert result.passed is True
+        assert "sprint-1/eval-dynamic" in captured
+
 
 class TestRunSprint:
     @pytest.mark.asyncio
@@ -414,3 +470,385 @@ class TestRunSprint:
         )
         assert result.passed is True
         assert result.attempts == 2
+
+    @pytest.mark.asyncio
+    async def test_phase_setter_called_for_sprint_transitions(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec §4.4:277-280 — phase_setter receives implementing→eval-static
+        transitions for a passing sprint. (eval-dynamic is launcher-emitted
+        and exercised in TestRunEvaluation.)"""
+
+        async def fake_negotiate(**_kw: Any) -> bool:
+            (_kw["sprint_dir"] / "contract.md").write_text("# Sprint 1\n", encoding="utf-8")
+            return True
+
+        async def fake_chunk_loop(**_kw: Any) -> ImplementationResult:
+            return ImplementationResult(ok=True, commit_sha="abc", summary="done")
+
+        async def fake_run_eval(**_kw: Any) -> EvaluationResult:
+            return EvaluationResult(
+                sprint_seq=1,
+                static_criteria=[],
+                dynamic_criteria=[],
+                routing_decision="",
+                passed=True,
+            )
+
+        monkeypatch.setattr(sprints, "negotiate_contract", fake_negotiate)
+        monkeypatch.setattr(sprints, "chunk_loop", fake_chunk_loop)
+        monkeypatch.setattr(sprints, "run_evaluation", fake_run_eval)
+
+        job_dir = tmp_path / "jobs" / "JOBID"
+        job_dir.mkdir(parents=True)
+        (job_dir / "design.md").write_text("D")
+        (job_dir / "plan.md").write_text("## Sprint 1: Title\n")
+
+        phases: list[str] = []
+
+        async def capture(p: str) -> None:
+            phases.append(p)
+
+        result = await run_sprint(
+            job_id="JOBID",
+            sprint_seq=1,
+            sprint_title="Title",
+            job_dir=job_dir,
+            options=JobOptions(),
+            captured_mcp={"context7": {}},
+            setting_sources=["user"],
+            generator_md="G",
+            evaluator_options_factory=lambda **_kw: object(),
+            codex_bin="/usr/bin/codex",
+            codex_overrides=("sandbox=workspace-write", "approval_policy=never"),
+            prior_tag=None,
+            phase_setter=capture,
+        )
+        assert result.passed is True
+        assert phases == ["sprint-1/implementing", "sprint-1/eval-static"]
+
+    @pytest.mark.asyncio
+    async def test_contract_not_sealed_retries_on_next_attempt(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec §6.1:408 — non-convergence after the cap counts as one retry;
+        the next sprint attempt restarts negotiation with a fresh contract.md."""
+        attempts_at_negotiate = [0]
+
+        async def fake_negotiate(**_kw: Any) -> bool:
+            attempts_at_negotiate[0] += 1
+            sprint_dir: Path = _kw["sprint_dir"]
+            # First attempt: never seals. Second: seals.
+            if attempts_at_negotiate[0] == 1:
+                return False
+            (sprint_dir / "contract.md").write_text(
+                "# Sprint 1\n## Round 1 — Generator\nAPPROVED\n", encoding="utf-8"
+            )
+            return True
+
+        async def fake_chunk_loop(**_kw: Any) -> ImplementationResult:
+            return ImplementationResult(ok=True, commit_sha="abc", summary="done")
+
+        async def fake_run_eval(**_kw: Any) -> EvaluationResult:
+            return EvaluationResult(
+                sprint_seq=1,
+                static_criteria=[],
+                dynamic_criteria=[],
+                routing_decision="",
+                passed=True,
+            )
+
+        monkeypatch.setattr(sprints, "negotiate_contract", fake_negotiate)
+        monkeypatch.setattr(sprints, "chunk_loop", fake_chunk_loop)
+        monkeypatch.setattr(sprints, "run_evaluation", fake_run_eval)
+
+        job_dir = tmp_path / "jobs" / "JOBID"
+        job_dir.mkdir(parents=True)
+        (job_dir / "design.md").write_text("D")
+        (job_dir / "plan.md").write_text("## Sprint 1: Title\n")
+
+        result = await run_sprint(
+            job_id="JOBID",
+            sprint_seq=1,
+            sprint_title="Title",
+            job_dir=job_dir,
+            options=JobOptions(max_sprint_retries=2),
+            captured_mcp={"context7": {}},
+            setting_sources=["user"],
+            generator_md="G",
+            evaluator_options_factory=lambda **_kw: object(),
+            codex_bin="/usr/bin/codex",
+            codex_overrides=("sandbox=workspace-write", "approval_policy=never"),
+            prior_tag=None,
+        )
+        assert result.passed is True
+        assert result.attempts == 2  # one retry consumed by failed negotiation
+        assert attempts_at_negotiate[0] == 2  # negotiation re-ran on attempt 2
+
+    @pytest.mark.asyncio
+    async def test_contract_negotiation_no_progress_then_seals(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec §6.1:404 — both-empty-bodies aborts via
+        ContractNegotiationFailedError; next attempt restarts negotiation."""
+        attempts = [0]
+
+        async def fake_negotiate(**_kw: Any) -> bool:
+            attempts[0] += 1
+            sprint_dir: Path = _kw["sprint_dir"]
+            if attempts[0] == 1:
+                raise ContractNegotiationFailedError("both empty")
+            (sprint_dir / "contract.md").write_text("# Sprint 1\n", encoding="utf-8")
+            return True
+
+        async def fake_chunk_loop(**_kw: Any) -> ImplementationResult:
+            return ImplementationResult(ok=True, commit_sha="abc", summary="done")
+
+        async def fake_run_eval(**_kw: Any) -> EvaluationResult:
+            return EvaluationResult(
+                sprint_seq=1,
+                static_criteria=[],
+                dynamic_criteria=[],
+                routing_decision="",
+                passed=True,
+            )
+
+        monkeypatch.setattr(sprints, "negotiate_contract", fake_negotiate)
+        monkeypatch.setattr(sprints, "chunk_loop", fake_chunk_loop)
+        monkeypatch.setattr(sprints, "run_evaluation", fake_run_eval)
+
+        job_dir = tmp_path / "jobs" / "JOBID"
+        job_dir.mkdir(parents=True)
+        (job_dir / "design.md").write_text("D")
+        (job_dir / "plan.md").write_text("## Sprint 1: Title\n")
+
+        result = await run_sprint(
+            job_id="JOBID",
+            sprint_seq=1,
+            sprint_title="Title",
+            job_dir=job_dir,
+            options=JobOptions(max_sprint_retries=2),
+            captured_mcp={"context7": {}},
+            setting_sources=["user"],
+            generator_md="G",
+            evaluator_options_factory=lambda **_kw: object(),
+            codex_bin="/usr/bin/codex",
+            codex_overrides=("sandbox=workspace-write", "approval_policy=never"),
+            prior_tag=None,
+        )
+        assert result.passed is True
+        assert attempts[0] == 2
+
+    @pytest.mark.asyncio
+    async def test_sprint_timeout_returns_sprint_timeout_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec §6.5 — `anyio.fail_after(max_sprint_duration_minutes * 60)`
+        wraps stages 1-3; on expiry, the sprint result must report
+        error='sprint_timeout' (not the generic max_sprint_retries_exceeded)."""
+
+        async def fake_negotiate(**_kw: Any) -> bool:
+            (_kw["sprint_dir"] / "contract.md").write_text("# Sprint 1\n", encoding="utf-8")
+            return True
+
+        async def fake_chunk_loop(**_kw: Any) -> ImplementationResult:
+            # Sleep longer than the sprint budget so anyio.fail_after fires.
+            await anyio.sleep(10)
+            return ImplementationResult(ok=True)
+
+        async def fake_run_eval(**_kw: Any) -> EvaluationResult:
+            return EvaluationResult(
+                sprint_seq=1,
+                static_criteria=[],
+                dynamic_criteria=[],
+                routing_decision="",
+                passed=True,
+            )
+
+        monkeypatch.setattr(sprints, "negotiate_contract", fake_negotiate)
+        monkeypatch.setattr(sprints, "chunk_loop", fake_chunk_loop)
+        monkeypatch.setattr(sprints, "run_evaluation", fake_run_eval)
+
+        job_dir = tmp_path / "jobs" / "JOBID"
+        job_dir.mkdir(parents=True)
+        (job_dir / "design.md").write_text("D")
+        (job_dir / "plan.md").write_text("## Sprint 1: Title\n")
+
+        # Use a 1-second timeout (max_sprint_duration_minutes is integer-only,
+        # so monkeypatch the conversion to use seconds-as-minutes).
+        original_fail_after = anyio.fail_after
+
+        def short_fail_after(_seconds: float) -> Any:
+            return original_fail_after(0.5)
+
+        monkeypatch.setattr(sprints.anyio, "fail_after", short_fail_after)
+
+        result = await run_sprint(
+            job_id="JOBID",
+            sprint_seq=1,
+            sprint_title="Title",
+            job_dir=job_dir,
+            options=JobOptions(max_sprint_retries=1),
+            captured_mcp={"context7": {}},
+            setting_sources=["user"],
+            generator_md="G",
+            evaluator_options_factory=lambda **_kw: object(),
+            codex_bin="/usr/bin/codex",
+            codex_overrides=("sandbox=workspace-write", "approval_policy=never"),
+            prior_tag=None,
+        )
+        assert result.passed is False
+        assert result.error == "sprint_timeout"
+
+    @pytest.mark.asyncio
+    async def test_unparseable_eval_exhaustion_surfaces_specific_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec §6.3:516 — when retries exhaust on persistently unparseable
+        eval.md, the terminal error_text must be
+        `evaluator_emitted_unparseable_eval_md`, not the generic
+        `max_sprint_retries_exceeded`."""
+
+        async def fake_negotiate(**_kw: Any) -> bool:
+            (_kw["sprint_dir"] / "contract.md").write_text("# Sprint 1\n", encoding="utf-8")
+            return True
+
+        async def fake_chunk_loop(**_kw: Any) -> ImplementationResult:
+            return ImplementationResult(ok=True, commit_sha="abc", summary="done")
+
+        async def fake_run_eval(**_kw: Any) -> EvaluationResult:
+            return EvaluationResult(
+                sprint_seq=1,
+                static_criteria=[],
+                dynamic_criteria=[],
+                routing_decision="",
+                passed=False,
+                unparseable=True,
+            )
+
+        monkeypatch.setattr(sprints, "negotiate_contract", fake_negotiate)
+        monkeypatch.setattr(sprints, "chunk_loop", fake_chunk_loop)
+        monkeypatch.setattr(sprints, "run_evaluation", fake_run_eval)
+
+        job_dir = tmp_path / "jobs" / "JOBID"
+        job_dir.mkdir(parents=True)
+        (job_dir / "design.md").write_text("D")
+        (job_dir / "plan.md").write_text("## Sprint 1: Title\n")
+
+        result = await run_sprint(
+            job_id="JOBID",
+            sprint_seq=1,
+            sprint_title="Title",
+            job_dir=job_dir,
+            options=JobOptions(max_sprint_retries=1),
+            captured_mcp={"context7": {}},
+            setting_sources=["user"],
+            generator_md="G",
+            evaluator_options_factory=lambda **_kw: object(),
+            codex_bin="/usr/bin/codex",
+            codex_overrides=("sandbox=workspace-write", "approval_policy=never"),
+            prior_tag=None,
+        )
+        assert result.passed is False
+        assert result.error == "evaluator_emitted_unparseable_eval_md"
+
+    @pytest.mark.asyncio
+    async def test_unparseable_eval_with_stderr_tail_on_nonzero_exit(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec §8.4:1023 — when launcher exits non-zero, the captured stderr
+        tail must surface in the terminal SprintResult.error."""
+
+        async def fake_negotiate(**_kw: Any) -> bool:
+            (_kw["sprint_dir"] / "contract.md").write_text("# Sprint 1\n", encoding="utf-8")
+            return True
+
+        async def fake_chunk_loop(**_kw: Any) -> ImplementationResult:
+            return ImplementationResult(ok=True, commit_sha="abc", summary="done")
+
+        async def fake_run_eval(**_kw: Any) -> EvaluationResult:
+            return EvaluationResult(
+                sprint_seq=1,
+                static_criteria=[],
+                dynamic_criteria=[],
+                routing_decision="",
+                passed=False,
+                unparseable=True,
+                launcher_stderr_tail="Traceback: SDKError: bad MCP config\n",
+            )
+
+        monkeypatch.setattr(sprints, "negotiate_contract", fake_negotiate)
+        monkeypatch.setattr(sprints, "chunk_loop", fake_chunk_loop)
+        monkeypatch.setattr(sprints, "run_evaluation", fake_run_eval)
+
+        job_dir = tmp_path / "jobs" / "JOBID"
+        job_dir.mkdir(parents=True)
+        (job_dir / "design.md").write_text("D")
+        (job_dir / "plan.md").write_text("## Sprint 1: Title\n")
+
+        result = await run_sprint(
+            job_id="JOBID",
+            sprint_seq=1,
+            sprint_title="Title",
+            job_dir=job_dir,
+            options=JobOptions(max_sprint_retries=1),
+            captured_mcp={"context7": {}},
+            setting_sources=["user"],
+            generator_md="G",
+            evaluator_options_factory=lambda **_kw: object(),
+            codex_bin="/usr/bin/codex",
+            codex_overrides=("sandbox=workspace-write", "approval_policy=never"),
+            prior_tag=None,
+        )
+        assert result.passed is False
+        assert result.error is not None
+        assert "evaluator_emitted_unparseable_eval_md" in result.error
+        assert "SDKError: bad MCP config" in result.error
+
+    @pytest.mark.asyncio
+    async def test_contract_never_seals_exhausts_retries(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec §6.1:408 — repeated non-convergence eventually exhausts
+        max_sprint_retries; sprint fails with the last negotiation error."""
+
+        async def fake_negotiate(**_kw: Any) -> bool:
+            return False  # never seals
+
+        async def fake_chunk_loop(**_kw: Any) -> ImplementationResult:
+            return ImplementationResult(ok=True)
+
+        async def fake_run_eval(**_kw: Any) -> EvaluationResult:
+            return EvaluationResult(
+                sprint_seq=1,
+                static_criteria=[],
+                dynamic_criteria=[],
+                routing_decision="",
+                passed=True,
+            )
+
+        monkeypatch.setattr(sprints, "negotiate_contract", fake_negotiate)
+        monkeypatch.setattr(sprints, "chunk_loop", fake_chunk_loop)
+        monkeypatch.setattr(sprints, "run_evaluation", fake_run_eval)
+
+        job_dir = tmp_path / "jobs" / "JOBID"
+        job_dir.mkdir(parents=True)
+        (job_dir / "design.md").write_text("D")
+        (job_dir / "plan.md").write_text("## Sprint 1: Title\n")
+
+        result = await run_sprint(
+            job_id="JOBID",
+            sprint_seq=1,
+            sprint_title="Title",
+            job_dir=job_dir,
+            options=JobOptions(max_sprint_retries=1),
+            captured_mcp={"context7": {}},
+            setting_sources=["user"],
+            generator_md="G",
+            evaluator_options_factory=lambda **_kw: object(),
+            codex_bin="/usr/bin/codex",
+            codex_overrides=("sandbox=workspace-write", "approval_policy=never"),
+            prior_tag=None,
+        )
+        assert result.passed is False
+        assert result.error == "contract_not_sealed"

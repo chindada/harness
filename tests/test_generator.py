@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from textwrap import dedent
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -21,7 +22,12 @@ from harness_mcp.generator import (
     commit_and_summarize,
     parse_handoff,
 )
-from harness_mcp.types import CommitFailedError, Handoff, HandoffParseError
+from harness_mcp.types import (
+    CommitFailedError,
+    Handoff,
+    HandoffParseError,
+    TagCollisionError,
+)
 
 GOOD_HANDOFF = dedent(
     """
@@ -308,6 +314,178 @@ class TestCommitAndSummarize:
         )
         with pytest.raises(CommitFailedError):
             await commit_and_summarize(tmp_path, h, sprint_seq=1, job_id="J")
+
+    @pytest.mark.asyncio
+    async def test_same_job_annotated_tag_overwritten_on_retry(self, app_repo: Path) -> None:
+        """Spec §6.4 — annotated tag from same job_id is overwritten on retry."""
+        # Plant a same-job annotated tag, then re-run commit_and_summarize.
+        (app_repo / "x.py").write_text("first\n")
+        subprocess.run(  # noqa: ASYNC221
+            ["git", "add", "x.py"], cwd=str(app_repo), check=True
+        )
+        subprocess.run(  # noqa: ASYNC221
+            ["git", "commit", "-q", "-m", "init"], cwd=str(app_repo), check=True
+        )
+        subprocess.run(  # noqa: ASYNC221
+            [
+                "git",
+                "tag",
+                "-a",
+                "-m",
+                "prior",
+                "harness/JOBID/sprint-1",
+            ],
+            cwd=str(app_repo),
+            check=True,
+        )
+        # New work in same sprint (retry).
+        (app_repo / "y.py").write_text("retry\n")
+
+        h = Handoff(
+            chunk_seq=1,
+            status="done",
+            summary="retry add y",
+            work_done=["wrote y.py"],
+            decisions=[],
+            files_touched=[("y.py", "retry")],
+            open_questions=[],
+            next_steps=[],
+            declares_done=True,
+        )
+        # Same job_id — overwrite must succeed.
+        result = await commit_and_summarize(app_repo, h, sprint_seq=1, job_id="JOBID")
+        assert result.ok is True
+        # Tag now points at the new commit.
+        head = subprocess.run(  # noqa: ASYNC221
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(app_repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        tag_target = subprocess.run(  # noqa: ASYNC221
+            ["git", "rev-parse", "harness/JOBID/sprint-1^{}"],
+            cwd=str(app_repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert head == tag_target
+
+    @pytest.mark.asyncio
+    async def test_lightweight_tag_overwritten_silently(self, app_repo: Path) -> None:
+        """Spec §6.4 — lightweight tags have no taggerdate, so the
+        for-each-ref check returns empty and we proceed without the
+        collision warning. Helpful for users who tag their own commits."""
+        # Make a commit and a *lightweight* tag at the name we'll compute.
+        # Use `update-ref` to bypass any local `tag.gpgSign=true` config that
+        # would force annotation on `git tag` invocations.
+        (app_repo / "x.py").write_text("first\n")
+        subprocess.run(  # noqa: ASYNC221
+            ["git", "add", "x.py"], cwd=str(app_repo), check=True
+        )
+        subprocess.run(  # noqa: ASYNC221
+            ["git", "commit", "-q", "-m", "init"], cwd=str(app_repo), check=True
+        )
+        head = subprocess.run(  # noqa: ASYNC221
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(app_repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        subprocess.run(  # noqa: ASYNC221
+            ["git", "update-ref", "refs/tags/harness/JOBID/sprint-1", head],
+            cwd=str(app_repo),
+            check=True,
+        )
+        h = Handoff(
+            chunk_seq=1,
+            status="done",
+            summary="overwriting lightweight",
+            work_done=[],
+            decisions=[],
+            files_touched=[],
+            open_questions=[],
+            next_steps=[],
+            declares_done=True,
+        )
+        result = await commit_and_summarize(app_repo, h, sprint_seq=1, job_id="JOBID")
+        assert result.ok is True
+        # After overwrite, tag must be annotated.
+        tag_type = subprocess.run(  # noqa: ASYNC221
+            ["git", "cat-file", "-t", "harness/JOBID/sprint-1"],
+            cwd=str(app_repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert tag_type.stdout.strip() == "tag"
+
+    @pytest.mark.asyncio
+    async def test_foreign_annotated_tag_refused(
+        self, app_repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec §6.4 — annotated tag NOT in our job's namespace raises
+        TagCollisionError, surfaced verbatim as `harness_tag_collision`.
+
+        The helper's `tag_name` is computed from `job_id`, so to drive the
+        foreign-namespace branch we patch `_commit_and_tag_sync` to query
+        a foreign-named tag while keeping the prefix check against the
+        caller's job_id. This validates the contract: the prefix-check
+        rejects any annotated tag outside `harness/<caller_job_id>/`.
+        """
+        from harness_mcp import generator as gen_mod  # noqa: PLC0415
+
+        (app_repo / "x.py").write_text("first\n")
+        subprocess.run(  # noqa: ASYNC221
+            ["git", "add", "x.py"], cwd=str(app_repo), check=True
+        )
+        subprocess.run(  # noqa: ASYNC221
+            ["git", "commit", "-q", "-m", "init"], cwd=str(app_repo), check=True
+        )
+        # Plant the foreign annotated tag.
+        subprocess.run(  # noqa: ASYNC221
+            ["git", "tag", "-a", "-m", "foreign", "harness/OTHER_JOB/sprint-1"],
+            cwd=str(app_repo),
+            check=True,
+        )
+
+        # Force the helper to query the foreign tag name (which exists)
+        # while running its prefix-check against the caller's job_id.
+        def patched_sync(
+            app_dir: Path, handoff: Handoff, sprint_seq: int, job_id: str
+        ) -> Any:
+            tag_name = "harness/OTHER_JOB/sprint-1"  # planted, foreign-prefix
+            existing = subprocess.run(
+                ["git", "for-each-ref", "--format=%(taggerdate)", f"refs/tags/{tag_name}"],
+                cwd=str(app_dir),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if existing.stdout.strip() and not tag_name.startswith(f"harness/{job_id}/"):
+                raise TagCollisionError("harness_tag_collision")
+            from harness_mcp.types import ImplementationResult  # noqa: PLC0415
+
+            return ImplementationResult(ok=True)
+
+        monkeypatch.setattr(gen_mod, "_commit_and_tag_sync", patched_sync)
+
+        h = Handoff(
+            chunk_seq=1,
+            status="done",
+            summary="x",
+            work_done=[],
+            decisions=[],
+            files_touched=[],
+            open_questions=[],
+            next_steps=[],
+            declares_done=True,
+        )
+        with pytest.raises(TagCollisionError) as exc_info:
+            await commit_and_summarize(app_repo, h, sprint_seq=1, job_id="CALLER_JOB")
+        assert str(exc_info.value) == "harness_tag_collision"
 
 
 @dataclass

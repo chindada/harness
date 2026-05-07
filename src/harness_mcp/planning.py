@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -131,7 +131,18 @@ def verify_skill_invoked(tool_uses: list[Any], *, skill: str) -> bool:
 
 
 class PlanPhaseFailed(HarnessToolError):
-    """Raised when the plan phase exhausts review rounds or hits a structural error."""
+    """Raised when the plan phase exhausts review rounds or hits a structural error.
+
+    Carries the spec-defined `current_phase` (one of `planning`, `plan-review`,
+    `plan-revision`) and an `error_text` string that the orchestrator writes
+    verbatim to the jobs row so `poll_build` reports the phase that actually
+    failed, not the one in effect when the exception was caught.
+    """
+
+    def __init__(self, error_text: str, *, phase: str = "planning") -> None:
+        super().__init__(error_text)
+        self.phase = phase
+        self.error_text = error_text
 
 
 # `*_options_factory` is a callable that returns a ClaudeAgentOptions instance per spawn.
@@ -179,6 +190,7 @@ async def run_planner(
     options: Any,  # noqa: ANN401  — opaque SDK ClaudeAgentOptions
     expected_plan_path: Path,
     require_skill: bool,
+    plan_version: int,
     log_path: Path | None = None,
 ) -> None:
     """One round of Planner. Verifies skill invocation AND that the written
@@ -186,7 +198,9 @@ async def run_planner(
 
     Per spec §5.1 step 7 / §5.2 step 0: on structural failure (missing file
     OR no Sprint markers) we re-prompt the Planner once with the explicit
-    failure description; second consecutive failure raises PlanPhaseFailed.
+    failure description; second consecutive failure raises PlanPhaseFailed
+    with `phase='planning'` (v1, §5.1:320) or `phase='plan-revision'` (v≥2,
+    §5.2:327) so the orchestrator reports the spec'd terminal phase.
     """
     msgs = await _drive_query(user_prompt, options, log_path)
 
@@ -211,8 +225,10 @@ async def run_planner(
         await _drive_query(retry, options, log_path)
 
     if not _plan_is_structurally_valid(expected_plan_path):
+        phase = "planning" if plan_version == 1 else "plan-revision"
         raise PlanPhaseFailed(
-            f"planner_emitted_unstructured_plan_after_retry: {expected_plan_path}"
+            "planner_emitted_unstructured_plan_after_retry",
+            phase=phase,
         )
 
 
@@ -226,7 +242,10 @@ async def run_reviewer(
     msgs = await _drive_query(user_prompt, options, log_path)
     _ = msgs  # drained for side effects
     if not expected_review_path.is_file():  # noqa: ASYNC240  — sync stat is acceptable here
-        raise PlanPhaseFailed(f"reviewer did not write {expected_review_path}")
+        raise PlanPhaseFailed(
+            f"reviewer_did_not_write_file: {expected_review_path}",
+            phase="plan-review",
+        )
 
 
 def _planner_user_prompt(job_dir: Path, plan_version: int, issues: list[str] | None) -> str:
@@ -258,20 +277,36 @@ async def run_plan_phase(
     planner_options_factory: PlannerOptionsFactory,
     reviewer_options_factory: ReviewerOptionsFactory,
     log_path: Path | None = None,
+    phase_setter: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[list[tuple[int, str]], int]:
     """Run the full §5 plan + review loop.
 
     Returns (sprints, rounds_taken). `rounds_taken` is the number of
     review-driven revisions, not counting the initial Planner call.
     Writes the final approved plan to `<job_dir>/plan.md`.
+
+    `phase_setter` (if provided) is awaited at every spec §4.4 plan-phase
+    transition (`planning` → `plan-review` → `plan-revision` → …) so
+    `poll_build` mirrors the live state. Defaults to a no-op for unit
+    tests that don't care about phase observability.
     """
     plan_version = 1
     rounds = 0
     last_issues: list[str] = []
 
+    async def _set_phase(phase: str) -> None:
+        if phase_setter is not None:
+            await phase_setter(phase)
+
     while True:
         plan_path = job_dir / "plan-history" / f"plan-v{plan_version}.md"
         review_path = job_dir / "plan-history" / f"review-v{plan_version}.md"
+
+        # Phase update: revisions enter `plan-revision` per §4.4 ("set during
+        # a revision round; flips back to plan-review after"). v1 stays in
+        # the orchestrator-owned `planning` phase.
+        if plan_version > 1:
+            await _set_phase("plan-revision")
 
         # Planner.
         planner_options = planner_options_factory(job_dir=job_dir, plan_version=plan_version)
@@ -281,6 +316,7 @@ async def run_plan_phase(
             options=planner_options,
             expected_plan_path=plan_path,
             require_skill=(plan_version == 1),  # only enforce on v1
+            plan_version=plan_version,
             log_path=log_path,
         )
 
@@ -289,8 +325,10 @@ async def run_plan_phase(
         # here, that's the second consecutive structural failure → fail hard.
         sprints = extract_sprints(plan_path)
         if not sprints:
+            phase = "planning" if plan_version == 1 else "plan-revision"
             raise PlanPhaseFailed(
-                f"plan-v{plan_version} contains no `## Sprint N:` markers after retry"
+                "planner_emitted_unstructured_plan_after_retry",
+                phase=phase,
             )
         if len(sprints) > options.max_sprints:
             # Skip reviewer; inject a synthetic issue and revise.
@@ -300,9 +338,18 @@ async def run_plan_phase(
             ]
             rounds += 1
             if rounds > options.max_plan_review_rounds:
-                raise PlanPhaseFailed("max_plan_review_rounds exceeded (sprint cap)")
+                # Spec §5.2:343 — cap exhaustion → phase=`plan-review` with
+                # error_text listing the unresolved [implementation] issues.
+                issues_text = "; ".join(last_issues)
+                raise PlanPhaseFailed(
+                    f"max_plan_review_rounds_exceeded: {issues_text}",
+                    phase="plan-review",
+                )
             plan_version += 1
             continue
+
+        # Phase: review.
+        await _set_phase("plan-review")
 
         # Reviewer.
         reviewer_options = reviewer_options_factory(job_dir=job_dir, plan_version=plan_version)
@@ -324,5 +371,10 @@ async def run_plan_phase(
         last_issues = review.implementation_issues
         rounds += 1
         if rounds > options.max_plan_review_rounds:
-            raise PlanPhaseFailed("max_plan_review_rounds exceeded")
+            # Spec §5.2:343 — list unresolved [implementation] issues.
+            issues_text = "; ".join(last_issues)
+            raise PlanPhaseFailed(
+                f"max_plan_review_rounds_exceeded: {issues_text}",
+                phase="plan-review",
+            )
         plan_version += 1

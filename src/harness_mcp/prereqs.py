@@ -91,7 +91,12 @@ def check_env() -> str:
 
 
 def check_codex_binary() -> str:
-    """Resolve $HARNESS_CODEX_BIN or `which codex`, run --version."""
+    """Resolve $HARNESS_CODEX_BIN or `which codex`, run --version.
+
+    Also reads `~/.codex/config.toml` (warn-only if missing) per spec
+    §10.1 step 2a — codex falls back to defaults, and we still force
+    `sandbox=workspace-write` and `approval_policy=never` per §10.5.
+    """
     bin_path = os.environ.get("HARNESS_CODEX_BIN") or shutil.which("codex")
     if not bin_path:
         raise PrereqFailedError(
@@ -113,7 +118,16 @@ def check_codex_binary() -> str:
         raise PrereqFailedError(
             f"Codex binary --version exited {proc.returncode}: {proc.stderr.strip()}"
         )
-    return f"OK codex: {proc.stdout.strip() or '(no version output)'}"
+
+    config_note = ""
+    config_path = Path.home() / ".codex" / "config.toml"
+    if not config_path.is_file():
+        config_note = (
+            f" (warning: {config_path} not found; codex will use defaults — "
+            "sandbox/approval are forced regardless)"
+        )
+
+    return f"OK codex: {proc.stdout.strip() or '(no version output)'}{config_note}"
 
 
 async def sweep_at_startup() -> str:

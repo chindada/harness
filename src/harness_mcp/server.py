@@ -229,7 +229,30 @@ server = FastMCP("harness-mcp", lifespan=lifespan)
 async def start_build(
     design_doc_path: str, options: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    """Start a new build job. Returns {job_id}."""
+    """Start a new build job from a feature design document.
+
+    Design:
+        Per spec §3, this is the entry point for the four-tool surface.
+        The call inserts a `pending` jobs row synchronously (so the
+        returned job_id is durable), copies design.md verbatim into the
+        job dir, then schedules the orchestrator coroutine on the
+        server's task group. The CAS-protected `pending → running`
+        transition happens on the orchestrator's first DB write
+        (orchestrator.run_job:160-168) — this closes the race where
+        cancel_build runs before the orchestrator coroutine starts.
+
+    Implementation:
+        Validates `design_doc_path` exists and is non-empty (else
+        DesignDocNotFoundError → DESIGN_DOC_NOT_FOUND), parses `options`
+        through JobOptions.from_dict (closed-set keys; rejects unknown
+        keys → INVALID_OPTIONS), then delegates to
+        start_orchestrator_inserts_row + task_group.start_soon. Returns
+        immediately; the orchestrator runs concurrently.
+
+    Example:
+        >>> await start_build("/abs/path/to/design.md", {"max_sprints": 5})
+        {"job_id": "01HC..."}
+    """
     p = Path(design_doc_path)
     if not p.is_file() or p.stat().st_size == 0:  # noqa: ASYNC240
         raise DesignDocNotFoundError(design_doc_path)
@@ -265,6 +288,25 @@ async def start_build(
 @server.tool()
 @_map_harness_errors
 async def poll_build(job_id: str) -> dict[str, Any]:
+    """Return the live status of a build job.
+
+    Design:
+        Read-only mirror of the jobs row plus a recomputed `sprints_completed`
+        count (only `status='passed'` rows). Per spec §3, every key the schema
+        documents is included so callers can render progress without joining
+        rows themselves.
+
+    Implementation:
+        Single SQLite reader connection (WAL); two queries: jobs row +
+        COUNT of passed sprints. Raises `UnknownJobError` if the row is
+        absent — the error decorator maps it to `UNKNOWN_JOB`.
+
+    Example:
+        >>> await poll_build("01HC...")
+        {"status": "running", "current_phase": "sprint-1/eval-static",
+         "last_message": "", "plan_review_rounds": 1,
+         "sprints_completed": 0, "started_at": ..., "updated_at": ...}
+    """
     async with open_reader() as r:
         row = r.execute(
             "SELECT status, current_phase, last_message, plan_review_rounds, "
@@ -291,6 +333,29 @@ async def poll_build(job_id: str) -> dict[str, Any]:
 @server.tool()
 @_map_harness_errors
 async def get_build_result(job_id: str) -> dict[str, Any]:
+    """Return the terminal artifacts of a finished build.
+
+    Design:
+        Per spec §3, only callable on terminal jobs (`completed`, `failed`,
+        `cancelled`, `interrupted`). Returns the produced app path, the
+        Summarizer's prose summary, per-sprint pass/fail/retry counts, and
+        wall-clock duration. The summary is read from `summary.md` if it
+        exists (Summarizer wrote it directly) and falls back to the
+        last_message column otherwise.
+
+    Implementation:
+        Two queries: jobs row (status + timestamps + last_message) + sprints
+        rows (seq, title, status, retry_count). Raises `UnknownJobError` for
+        unknown ids and `JobNotFinishedError` if the job is still in a
+        non-terminal state. Both surface as structured `code` per §3.1.
+
+    Example:
+        >>> await get_build_result("01HC...")
+        {"app_path": ".../app", "summary": "Built X with...",
+         "final_status": "completed",
+         "sprints": [{"seq": 1, "title": "...", "status": "passed", "retry_count": 0}],
+         "plan_review_rounds": 0, "duration_seconds": 1234.5}
+    """
     async with open_reader() as r:
         row = r.execute(
             "SELECT status, current_phase, last_message, plan_review_rounds, "
@@ -330,4 +395,24 @@ async def get_build_result(job_id: str) -> dict[str, Any]:
 @server.tool()
 @_map_harness_errors
 async def cancel_build(job_id: str) -> dict[str, Any]:
+    """Cancel a running or pending build. Idempotent.
+
+    Design:
+        Per spec §3.2, terminal jobs return `was_already_terminal=True`
+        without further action. `pending` jobs are CAS-flipped to
+        `cancelled` (covers the rare race where the orchestrator coroutine
+        hasn't started yet). `running` jobs have their cancel scope
+        cancelled after the row write, propagating `CancelledError`
+        through every nested SDK client.
+
+    Implementation:
+        Delegates to orchestrator.cancel_job, which encapsulates the
+        `pending → cancelled` CAS, the `running → cancelled` row write,
+        and the cancel-scope lookup. Raises `UnknownJobError` if the row
+        is absent — the error decorator maps it to `UNKNOWN_JOB`.
+
+    Example:
+        >>> await cancel_build("01HC...")
+        {"ok": True, "was_already_terminal": False}
+    """
     return await cancel_job(job_id)

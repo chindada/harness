@@ -34,6 +34,7 @@ from harness_mcp.types import (
     Handoff,
     HandoffParseError,
     ImplementationResult,
+    TagCollisionError,
 )
 
 logger = logging.getLogger(__name__)
@@ -270,9 +271,10 @@ async def commit_and_summarize(
     subject + work-done/decisions in the body. If it doesn't, skip the
     commit but still tag (so subsequent sprints can diff against it).
 
-    Tag overwrite (`git tag -f`) is left to the caller — the orchestrator
-    runs the namespace-aware annotated-tag-collision check from §6.4
-    before invoking this helper.
+    Tag overwrite (`git tag -f`): per spec §6.4 we run the namespace-aware
+    annotated-tag-collision check inline — same-job tags get overwritten
+    (with a warning); other-job or user-curated annotated tags raise
+    TagCollisionError so the sprint surfaces `harness_tag_collision`.
     """
     # All git invocations are blocking C calls; offload so the event loop stays free.
     return await anyio.to_thread.run_sync(
@@ -324,8 +326,26 @@ def _commit_and_tag_sync(
         commit_sha = head.stdout.strip() if head.returncode == 0 else None
 
     tag_name = f"harness/{job_id}/sprint-{sprint_seq}"
+    # Spec §6.4 — narrowed annotated-tag collision check. `git for-each-ref`
+    # with `%(taggerdate)` returns non-empty only for *annotated* tags
+    # (lightweight tags have no taggerdate). Non-empty + foreign namespace
+    # = refuse; non-empty + same job = retry (warn + overwrite).
+    existing = subprocess.run(
+        ["git", "for-each-ref", "--format=%(taggerdate)", f"refs/tags/{tag_name}"],
+        cwd=str(app_dir),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if existing.returncode == 0 and existing.stdout.strip():
+        own_namespace = f"harness/{job_id}/"
+        if not tag_name.startswith(own_namespace):
+            raise TagCollisionError("harness_tag_collision")
+        logger.warning(
+            "overwriting prior harness annotated tag from same job; this is a retry: %s",
+            tag_name,
+        )
     # Use -a -m to support environments where tag.gpgsign / tag annotation is forced.
-    # The orchestrator owns collision detection (§6.4) before calling this helper.
     _git(["tag", "-f", "-a", "-m", f"Sprint {sprint_seq} for {job_id}", tag_name], cwd=app_dir)
 
     return ImplementationResult(
@@ -339,7 +359,7 @@ def _commit_and_tag_sync(
 # ---------- Layer 3: chunk_loop ----------
 
 
-async def chunk_loop(  # noqa: PLR0912 — branching follows the §7 chunk-loop state machine
+async def chunk_loop(  # noqa: PLR0912, PLR0915, PLR0911 — branching follows the §7 chunk-loop state machine
     *,
     app_dir: Path,
     sprint_dir: Path,
@@ -458,6 +478,8 @@ async def chunk_loop(  # noqa: PLR0912 — branching follows the §7 chunk-loop 
                         return await commit_and_summarize(
                             app_dir, synthetic, sprint_seq=sprint_seq, job_id=job_id
                         )
+                    except TagCollisionError as e:
+                        return ImplementationResult(ok=False, error=str(e))
                     except CommitFailedError as ce:
                         return ImplementationResult(ok=False, error=f"commit_failed: {ce}")
             return ImplementationResult(ok=False, error="handoff_persistently_malformed")
@@ -467,6 +489,9 @@ async def chunk_loop(  # noqa: PLR0912 — branching follows the §7 chunk-loop 
                 return await commit_and_summarize(
                     app_dir, handoff, sprint_seq=sprint_seq, job_id=job_id
                 )
+            except TagCollisionError as e:
+                # Spec §6.4: surface verbatim, no `commit_failed:` prefix.
+                return ImplementationResult(ok=False, error=str(e))
             except Exception as e:  # CommitFailedError or worse
                 return ImplementationResult(ok=False, error=f"commit_failed: {e}")
 

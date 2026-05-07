@@ -107,6 +107,12 @@ async def _run(payload: dict[str, Any]) -> int:
                 await pipe_claude_msg_to_log(msg, log_path)
             await sync_eval_md(eval_path, expect_section="## Static audit")
 
+            # Spec §4.4:280 — emit a phase marker on stderr so the orchestrator
+            # can flip current_phase to `sprint-<N>/eval-dynamic` between the
+            # two queries. Stderr (not stdout) keeps the marker out of any
+            # piped log capture.
+            print("PHASE:eval-dynamic", file=sys.stderr, flush=True)
+
             await client.query(
                 dynamic_verification_prompt(
                     job_dir=job_dir,
