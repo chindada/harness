@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "harness-mcp"
+version = "0.1.0"
+description = "MCP server orchestrating multi-hour, multi-agent application builds from a design document."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "harness-mcp authors" }]
+dependencies = [
+  "mcp>=1.12.4",
+  "claude-agent-sdk>=0.1.0",
+  "codex-app-server-sdk>=0.3.2",
+  "anyio>=4.5",
+  "httpx>=0.27",
+  "python-ulid>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.6",
+]
+
+[project.scripts]
+harness-mcp = "harness_mcp.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harness_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "ASYNC", "PL", "RUF", "ANN"]
+ignore = ["PLR0913"]  # allow many args on dataclasses / config-shape helpers
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["ANN401", "PLR2004"]
