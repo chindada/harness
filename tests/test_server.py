@@ -104,3 +104,137 @@ class TestToolErrorIntegration:
         design.write_text("# design\n", encoding="utf-8")
         result = await start_build(design_doc_path=str(design), options={"bogus_key": 1})
         _assert_error_result(result, "INVALID_OPTIONS")
+
+
+class TestToolHappyPath:
+    """Spec §3 — every documented success-shape key must be present in the
+    tool's return dict, and the values must come from the live state row.
+    """
+
+    @pytest.mark.asyncio
+    async def test_poll_build_returns_full_documented_shape(
+        self, initialized_db: Path
+    ) -> None:
+        """Spec §3 row + computed `sprints_completed` field. Insert a row
+        with two passed sprints and one failed; verify poll_build returns
+        every documented key with the right value."""
+        await db_write(
+            "INSERT INTO jobs (id, status, current_phase, design_path, options_json, "
+            "last_message, plan_review_rounds, started_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "POLL_J",
+                "running",
+                "sprint-3/eval-static",
+                "/abs/design.md",
+                "{}",
+                "halfway through",
+                2,
+                1700000000000,
+                1700000060000,
+            ),
+        )
+        # Two passed + one failed sprint — sprints_completed must equal 2.
+        for seq, status in [(1, "passed"), (2, "passed"), (3, "failed")]:
+            await db_write(
+                "INSERT INTO sprints (job_id, seq, title, status) VALUES (?, ?, ?, ?)",
+                ("POLL_J", seq, f"S{seq}", status),
+            )
+        result = await poll_build("POLL_J")
+        # Spec §3 documented keys, exact set.
+        assert set(result.keys()) == {
+            "status",
+            "current_phase",
+            "last_message",
+            "plan_review_rounds",
+            "sprints_completed",
+            "started_at",
+            "updated_at",
+        }
+        assert result["status"] == "running"
+        assert result["current_phase"] == "sprint-3/eval-static"
+        assert result["last_message"] == "halfway through"
+        assert result["plan_review_rounds"] == 2
+        assert result["sprints_completed"] == 2
+        assert result["started_at"] == 1700000000000
+        assert result["updated_at"] == 1700000060000
+
+    @pytest.mark.asyncio
+    async def test_get_build_result_returns_full_documented_shape(
+        self, initialized_db: Path, tmp_harness_home: Path
+    ) -> None:
+        """Spec §3 — get_build_result on terminal job returns app_path,
+        summary, final_status, sprints list, plan_review_rounds, duration."""
+        await db_write(
+            "INSERT INTO jobs (id, status, current_phase, design_path, options_json, "
+            "last_message, plan_review_rounds, started_at, updated_at, finished_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "DONE_J",
+                "completed",
+                "done",
+                "/abs/design.md",
+                "{}",
+                "fallback summary text",
+                3,
+                1700000000000,
+                1700000123000,
+                1700000123000,
+            ),
+        )
+        await db_write(
+            "INSERT INTO sprints (job_id, seq, title, status, retry_count) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("DONE_J", 1, "Frame the app", "passed", 1),
+        )
+        # Surface a real summary.md so the on-disk override is exercised.
+        job_dir = tmp_harness_home / "jobs" / "DONE_J"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        (job_dir / "summary.md").write_text("real summary from disk", encoding="utf-8")
+
+        result = await get_build_result("DONE_J")
+        assert set(result.keys()) == {
+            "app_path",
+            "summary",
+            "final_status",
+            "sprints",
+            "plan_review_rounds",
+            "duration_seconds",
+        }
+        assert result["app_path"].endswith("/jobs/DONE_J/app")
+        # summary.md on disk wins over last_message fallback.
+        assert result["summary"] == "real summary from disk"
+        assert result["final_status"] == "completed"
+        assert result["sprints"] == [
+            {"seq": 1, "title": "Frame the app", "status": "passed", "retry_count": 1}
+        ]
+        assert result["plan_review_rounds"] == 3
+        assert result["duration_seconds"] == 123.0  # (finished - started) / 1000
+
+    @pytest.mark.asyncio
+    async def test_get_build_result_falls_back_to_last_message_when_summary_missing(
+        self, initialized_db: Path
+    ) -> None:
+        """Spec §3 / server.py: if summary.md is absent, surface
+        last_message in the `summary` field instead."""
+        await db_write(
+            "INSERT INTO jobs (id, status, current_phase, design_path, options_json, "
+            "last_message, plan_review_rounds, started_at, updated_at, finished_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "FB_J",
+                "failed",
+                "sprint-2/retry",
+                "/abs/design.md",
+                "{}",
+                "sprint_timeout",
+                0,
+                1,
+                2,
+                3,
+            ),
+        )
+        result = await get_build_result("FB_J")
+        # Fallback engaged because no summary.md was written.
+        assert result["summary"] == "sprint_timeout"
+        assert result["final_status"] == "failed"

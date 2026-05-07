@@ -104,6 +104,26 @@ class TestParseHandoff:
         assert ("app.py", "") in h.files_touched
         assert ("models.py", "refactored") in h.files_touched
 
+    def test_files_touched_empty_path_dropped_with_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Spec §7.1:794 — empty `path` → drop the entry with a warning.
+
+        Tests `_parse_files_touched` directly with a body that the bullet
+        regex matches but whose captured content strips to empty. This
+        bypasses parse_handoff's section-level strip(), which would
+        otherwise eat trailing whitespace and prevent the regex from ever
+        seeing a whitespace-only bullet body.
+        """
+        with caplog.at_level("WARNING", logger="harness_mcp.generator"):
+            result = gen_mod._parse_files_touched("-   ")
+        # Whitespace-only bullet → empty path → dropped, not appended.
+        assert result == [], f"empty-path entry leaked: {result}"
+        # Warning emitted with the diagnostic message.
+        warns = [r for r in caplog.records if "files_touched" in r.message]
+        assert warns, f"no warning logged for empty-path drop; records={caplog.records}"
+        assert "empty path" in warns[0].message
+
     def test_chunk_seq_inferred_from_filename(self, tmp_path: Path) -> None:
         path = tmp_path / "handoff-007.md"
         path.write_text(GOOD_HANDOFF, encoding="utf-8")
@@ -714,3 +734,164 @@ class TestChunkLoop:
             check=True,
         )
         assert "harness/JOBID/sprint-1" in tags.stdout
+
+    @pytest.mark.asyncio
+    async def test_chunk_loop_breaks_when_step_count_reaches_reset_steps(
+        self, app_repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Spec §7.2 — `step_count >= options.codex_reset_steps` breaks the
+        chunk's event stream. Track how many events the stream actually
+        yields per chunk; with reset_steps=2 the loop must observe at most
+        2 `item/started` events before breaking, even if more are queued.
+        """
+        sprint_dir = tmp_path / "sprint-1"
+        sprint_dir.mkdir()
+        (sprint_dir / "contract.md").write_text("CONTRACT")
+
+        per_chunk_yields: list[int] = []
+        chunk_idx = [0]
+
+        @asynccontextmanager
+        async def fake_async_codex(*_a: object, **_kw: object) -> AsyncIterator[object]:
+            class _T:
+                async def turn(self, _input: object) -> object:
+                    # Pre-write an in-progress handoff so chunk_loop continues
+                    # to the next chunk after this stream breaks.
+                    (sprint_dir / f"handoff-{chunk_idx[0] + 1:03d}.md").write_text(
+                        GOOD_HANDOFF, encoding="utf-8"
+                    )
+                    chunk_idx[0] += 1
+                    yields_this_chunk = [0]
+                    per_chunk_yields.append(0)
+                    chunk_pos = len(per_chunk_yields) - 1
+
+                    class _Stream:
+                        def __aiter__(self) -> Any:
+                            return self
+
+                        async def __anext__(self) -> object:
+                            # Always emit `item/started`. The chunk_loop must
+                            # break itself once step_count hits reset_steps.
+                            yields_this_chunk[0] += 1
+                            per_chunk_yields[chunk_pos] = yields_this_chunk[0]
+                            return _item_started()
+
+                    return SimpleNamespace(stream=_Stream)
+
+            class _Wrap:
+                async def thread_start(self) -> _T:
+                    return _T()
+
+            yield _Wrap()
+
+        monkeypatch.setattr(gen_mod, "AsyncCodex", fake_async_codex)
+
+        # codex_reset_steps=2: chunk_loop must break after observing 2 item/started.
+        # codex_reset_minutes huge so the wall-clock branch never fires here.
+        opts = JobOptions(
+            codex_reset_steps=2, codex_reset_minutes=99999, max_codex_chunks_per_sprint=2
+        )
+        result = await chunk_loop(
+            app_dir=app_repo,
+            sprint_dir=sprint_dir,
+            contract_path=sprint_dir / "contract.md",
+            design_path=None,
+            plan_section_path=None,
+            log_path=sprint_dir / "log.txt",
+            options=opts,
+            generator_md_text="G",
+            sprint_seq=1,
+            job_id="J",
+            eval_md_for_retry=None,
+        )
+        # Each chunk's stream yields exactly 2 events (the reset_steps
+        # threshold) before chunk_loop breaks. Two chunks = two entries.
+        assert per_chunk_yields == [2, 2], (
+            f"expected 2 yields per chunk (reset_steps=2), got {per_chunk_yields}"
+        )
+        # Loop hit the chunk cap on in-progress handoffs.
+        assert result.ok is False
+        assert "chunk_cap" in (result.error or "") or "exhausted" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_chunk_loop_breaks_when_wall_clock_exceeds_reset_minutes(
+        self, app_repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Spec §7.2 — `monotonic() - chunk_started >= reset_minutes * 60`
+        breaks the stream. Use a controllable monotonic clock so the test
+        is deterministic: advance time only via the fake."""
+        sprint_dir = tmp_path / "sprint-1"
+        sprint_dir.mkdir()
+        (sprint_dir / "contract.md").write_text("CONTRACT")
+
+        # Fake monotonic clock the chunk_loop sees. Each call advances 0.5s.
+        # codex_reset_minutes=0.01 -> 0.6 seconds. Two clock advances put
+        # us past the threshold.
+        clock_now = [1000.0]
+
+        def fake_monotonic() -> float:
+            clock_now[0] += 0.5
+            return clock_now[0]
+
+        monkeypatch.setattr(gen_mod, "monotonic", fake_monotonic)
+
+        per_chunk_yields: list[int] = []
+        chunk_idx = [0]
+
+        @asynccontextmanager
+        async def fake_async_codex(*_a: object, **_kw: object) -> AsyncIterator[object]:
+            class _T:
+                async def turn(self, _input: object) -> object:
+                    (sprint_dir / f"handoff-{chunk_idx[0] + 1:03d}.md").write_text(
+                        GOOD_HANDOFF, encoding="utf-8"
+                    )
+                    chunk_idx[0] += 1
+                    per_chunk_yields.append(0)
+                    chunk_pos = len(per_chunk_yields) - 1
+
+                    class _Stream:
+                        def __aiter__(self) -> Any:
+                            return self
+
+                        async def __anext__(self) -> object:
+                            per_chunk_yields[chunk_pos] += 1
+                            # Use a non-step event so step_count stays at 0;
+                            # only the wall-clock branch is exercised.
+                            return _agent_message("...")
+
+                    return SimpleNamespace(stream=_Stream)
+
+            class _Wrap:
+                async def thread_start(self) -> _T:
+                    return _T()
+
+            yield _Wrap()
+
+        monkeypatch.setattr(gen_mod, "AsyncCodex", fake_async_codex)
+
+        # reset_minutes=0.01 → 0.6s threshold. Each fake_monotonic() call
+        # advances by 0.5s. The first call is for `chunk_started = monotonic()`
+        # outside the loop (at t=1000.5). Inside the per-event branch it ticks
+        # to 1001.0 (delta=0.5; below threshold), then 1001.5 (delta=1.0; above).
+        # So the second event triggers the break.
+        opts = JobOptions(
+            codex_reset_steps=99999, codex_reset_minutes=0.01, max_codex_chunks_per_sprint=2
+        )
+        await chunk_loop(
+            app_dir=app_repo,
+            sprint_dir=sprint_dir,
+            contract_path=sprint_dir / "contract.md",
+            design_path=None,
+            plan_section_path=None,
+            log_path=sprint_dir / "log.txt",
+            options=opts,
+            generator_md_text="G",
+            sprint_seq=1,
+            job_id="J",
+            eval_md_for_retry=None,
+        )
+        # Each chunk yields 2 events before the wall-clock branch triggers
+        # the break (event 2 sees delta >= 1.0s > 0.6s threshold).
+        assert per_chunk_yields == [2, 2], (
+            f"expected 2 yields per chunk (wall-clock break at event 2), got {per_chunk_yields}"
+        )

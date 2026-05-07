@@ -17,6 +17,7 @@ from typing import Any
 
 import anyio
 
+from harness_mcp import __version__
 from harness_mcp.config import JobOptions
 from harness_mcp.contracts import (
     append_round_atomic,
@@ -114,7 +115,7 @@ async def _drive_codex_round(
             config_overrides=codex_overrides,
             client_name="harness-mcp",
             client_title="Harness Generator",
-            client_version="0.1.0",
+            client_version=__version__,
         )
         if AppServerConfig is not None
         else None
@@ -420,7 +421,39 @@ def _slice_plan_section(plan_text: str, sprint_seq: int) -> str:
     return ""
 
 
-async def run_sprint(  # noqa: PLR0915 — sprint state machine has many branches
+# Spec §6.4: a criterion that fails in this many or more retry attempts is
+# treated as "persistently unrealizable under the current contract".
+_PERSISTENT_FAIL_THRESHOLD = 2
+
+
+def _find_persistent_criterion(
+    failures_per_attempt: list[list[str]],
+    last_eval_order: list[str],
+) -> int | None:
+    """Spec §6.4: return 1-based index of a criterion that failed in ≥ 2 attempts.
+
+    Identifies criteria by text (the contract is read-only across retries, so
+    texts are stable). Index is the criterion's 1-based position in the most
+    recent eval's combined static+dynamic ordering.
+    """
+    if len(failures_per_attempt) < _PERSISTENT_FAIL_THRESHOLD:
+        return None
+    counts: collections.Counter[str] = collections.Counter()
+    for attempt_failures in failures_per_attempt:
+        for text in set(attempt_failures):  # dedupe within one attempt
+            counts[text] += 1
+    persistent = {
+        text for text, count in counts.items() if count >= _PERSISTENT_FAIL_THRESHOLD
+    }
+    if not persistent:
+        return None
+    for i, text in enumerate(last_eval_order, start=1):
+        if text in persistent:
+            return i
+    return None
+
+
+async def run_sprint(  # noqa: PLR0912, PLR0915 — sprint state machine has many branches
     *,
     job_id: str,
     sprint_seq: int,
@@ -475,6 +508,10 @@ async def run_sprint(  # noqa: PLR0915 — sprint state machine has many branche
     last_error: str | None = None
     last_unparseable = False
     last_stderr_tail = ""
+    # Spec §6.4: track failed criterion texts per attempt to detect persistent
+    # cross-retry failures (same criterion fails ≥ 2 attempts).
+    failed_criterion_attempts: list[list[str]] = []
+    last_eval_criteria_order: list[str] = []
 
     while attempts <= options.max_sprint_retries:
         attempts += 1
@@ -557,6 +594,16 @@ async def run_sprint(  # noqa: PLR0915 — sprint state machine has many branche
                 last_unparseable = eval_result.unparseable
                 last_stderr_tail = eval_result.launcher_stderr_tail
                 eval_md_for_retry = sprint_dir / "eval.md"
+                # Spec §6.4: record this attempt's failed criteria so we can
+                # detect cross-attempt persistence at terminal.
+                if not eval_result.unparseable:
+                    combined = (
+                        list(eval_result.static_criteria) + list(eval_result.dynamic_criteria)
+                    )
+                    failed_criterion_attempts.append(
+                        [c.text for c in combined if c.result == "FAIL"]
+                    )
+                    last_eval_criteria_order = [c.text for c in combined]
         except TimeoutError:
             return SprintResult(
                 sprint_seq=sprint_seq,
@@ -572,7 +619,18 @@ async def run_sprint(  # noqa: PLR0915 — sprint state machine has many branche
             # non-zero exit so the operator can see what crashed.
             terminal_error = f"{terminal_error}: {last_stderr_tail.strip()}"
     else:
-        terminal_error = last_error or "max_sprint_retries_exceeded"
+        # Spec §6.4: if the same criterion fails ≥ 2 attempts, surface the
+        # specific persistence error so the operator can spot a contract-design
+        # issue rather than an implementation issue.
+        persistent_idx = _find_persistent_criterion(
+            failed_criterion_attempts, last_eval_criteria_order
+        )
+        if persistent_idx is not None:
+            terminal_error = (
+                f"criterion_{persistent_idx}_persistently_unrealizable_under_current_contract"
+            )
+        else:
+            terminal_error = last_error or "max_sprint_retries_exceeded"
     return SprintResult(
         sprint_seq=sprint_seq,
         passed=False,

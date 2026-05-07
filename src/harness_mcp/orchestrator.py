@@ -50,7 +50,29 @@ async def unregister_scope(job_id: str) -> None:
 
 
 async def cancel_job(job_id: str) -> dict[str, Any]:
-    """Implement §3.2 cancel_build semantics. Idempotent."""
+    """Cancel a job. Idempotent.
+
+    Design:
+        Per spec §3.2, terminal jobs return ``was_already_terminal=True``
+        without further action. Pending jobs are flipped to ``cancelled``
+        directly (the orchestrator coroutine's first DB write is a CAS
+        UPDATE with ``WHERE status='pending'`` — when we get there it
+        will match zero rows and exit cleanly). Running jobs have their
+        cancel scope looked up in the registry and ``scope.cancel()``
+        called after the row has been written, so the orchestrator sees
+        the cancel state on its next read.
+
+    Implementation:
+        Single read for the current status, then one of: idempotent
+        short-circuit (terminal), pending UPDATE, or running UPDATE +
+        scope lookup + ``scope.cancel()``. The DB write happens before
+        ``scope.cancel()`` so the propagating cancellation can never
+        overwrite the row's ``cancelled`` status.
+
+    Example:
+        >>> await cancel_job("01HC...")
+        {"ok": True, "was_already_terminal": False}
+    """
     async with open_reader() as r:
         row = r.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
     if row is None:
@@ -113,10 +135,10 @@ async def start_orchestrator_inserts_row(
         check=True,
     )
 
-    # Verbatim design copy.
-    (job_dir / "design.md").write_text(
-        design_doc_path.read_text(encoding="utf-8"),  # noqa: ASYNC240
-        encoding="utf-8",
+    # Spec §5.1:287 — verbatim (byte-for-byte) copy. Using read_text/write_text
+    # would normalize newlines (CRLF → LF) and violate "verbatim".
+    (job_dir / "design.md").write_bytes(
+        design_doc_path.read_bytes(),  # noqa: ASYNC240
     )
 
     await db_write(
@@ -236,11 +258,15 @@ async def run_job(
                 )
 
                 final_status = "passed" if result.passed else "failed"
-                await db_write(
-                    "UPDATE sprints SET status=?, retry_count=?, finished_at=? "
-                    "WHERE job_id=? AND seq=?",
-                    (final_status, result.attempts - 1, now_ms(), job_id, seq),
-                )
+                # Spec §6.5:558-565 — bound the final per-sprint state write
+                # with a shielded 15-second grace so a stuck SDK __aexit__ or
+                # racing cancel can't leave the sprint row in 'running'.
+                with anyio.CancelScope(shield=True), anyio.move_on_after(15):
+                    await db_write(
+                        "UPDATE sprints SET status=?, retry_count=?, finished_at=? "
+                        "WHERE job_id=? AND seq=?",
+                        (final_status, result.attempts - 1, now_ms(), job_id, seq),
+                    )
 
                 if not result.passed:
                     await db_write(

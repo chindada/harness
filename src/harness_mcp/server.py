@@ -137,19 +137,24 @@ def _make_reviewer_options_factory(
 def _make_evaluator_options_factory(
     prereqs_result: PrereqsResult, *, job_dir: Path
 ) -> Callable[..., Any]:
+    """Build the Evaluator options used for **contract negotiation** only.
+
+    Spec §6.1:399 — at this stage the Evaluator runs `query()` with
+    `mcp_servers = {"context7": ...}` (no playwright). Playwright is
+    introduced later, inside the launcher subprocess (evaluator_runner.py),
+    where the actual evaluation phase needs it for dynamic verification.
+    """
+
     def _factory(**_kw: Any) -> Any:  # noqa: ANN401
         from claude_agent_sdk import (  # type: ignore[import-untyped]  # noqa: PLC0415
             ClaudeAgentOptions,
         )
 
-        mcp = {"context7": prereqs_result.captured_mcp["context7"]}
-        if "playwright" in prereqs_result.captured_mcp:
-            mcp["playwright"] = prereqs_result.captured_mcp["playwright"]
         return ClaudeAgentOptions(
             system_prompt=_resolved_prompt_text("evaluator.md"),
             cwd=str(_kw.get("job_dir", job_dir)),
             setting_sources=prereqs_result.setting_sources,
-            mcp_servers=mcp,
+            mcp_servers={"context7": prereqs_result.captured_mcp["context7"]},
             extra_args={"strict-mcp-config": None},
             permission_mode="acceptEdits",
         )

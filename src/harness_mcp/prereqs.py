@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from harness_mcp import __version__
 from harness_mcp.config import harness_home, jobs_root, state_db_path
 from harness_mcp.mcp_capture import (
     capture_from_mcp_status,
@@ -75,7 +76,26 @@ def format_doctor_report(report: DoctorReport) -> str:
 
 
 async def check_paths_and_db() -> str:
-    """Resolve ~/.harness, mkdir -p jobs/, init the state DB."""
+    """First lifespan prereq: ensure the harness home tree and state DB exist.
+
+    Design:
+        Per spec §10.1 step 1, the server must guarantee `~/.harness/`
+        and `~/.harness/jobs/` exist and the SQLite state DB is opened
+        with WAL mode and the schema applied. This is the only prereq
+        with side effects on the filesystem; everything downstream
+        assumes it has run.
+
+    Implementation:
+        Resolves `harness_home()` (honoring `$HARNESS_HOME`), creates
+        the home and `jobs/` directories (idempotent), and calls
+        `init_db()` which is itself idempotent (`CREATE TABLE IF NOT
+        EXISTS`). Returns a one-line OK summary that the doctor CLI
+        prints to the user.
+
+    Example:
+        >>> await check_paths_and_db()
+        'OK paths: home=/.../.harness; state_db=/.../.harness/state.db'
+    """
     home = harness_home()
     home.mkdir(parents=True, exist_ok=True)
     jobs_root().mkdir(exist_ok=True)
@@ -188,7 +208,7 @@ async def probe_codex_sdk_shape() -> tuple[str, tuple[str, ...]]:
                 config_overrides=form,
                 client_name="harness-mcp",
                 client_title="Harness Probe",
-                client_version="0.1.0",
+                client_version=__version__,
             )
             try:
                 async with _AsyncCodex(config=cfg) as codex:

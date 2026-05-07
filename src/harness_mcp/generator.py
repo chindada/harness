@@ -26,6 +26,7 @@ try:
 except ImportError:  # pragma: no cover  — only hit if SDK isn't installed during isolated unit runs
     AsyncCodex = AppServerConfig = TextInput = None  # type: ignore[assignment]
 
+from harness_mcp import __version__
 from harness_mcp.config import JobOptions
 from harness_mcp.logging_setup import EventLogger
 from harness_mcp.types import (
@@ -61,7 +62,12 @@ def _split_sections(text: str) -> dict[str, str]:
 
 
 def _parse_files_touched(body: str) -> list[tuple[str, str]]:
-    """Each bullet → (path, reason). Split on first ` — ` (em-dash)."""
+    """Each bullet → (path, reason). Split on first ` — ` (em-dash).
+
+    Spec §7.1:794 — empty `path` after stripping must be dropped with a
+    warning so a malformed handoff bullet is visible in operator logs
+    rather than silently disappearing.
+    """
     out: list[tuple[str, str]] = []
     for m in _BULLET_RE.finditer(body):
         bullet = m.group(1).strip()
@@ -73,6 +79,8 @@ def _parse_files_touched(body: str) -> list[tuple[str, str]]:
             path, reason = bullet, ""
         if path:
             out.append((path, reason))
+        else:
+            logger.warning("files_touched: dropping bullet with empty path: %r", bullet)
     return out
 
 
@@ -401,7 +409,7 @@ async def chunk_loop(  # noqa: PLR0912, PLR0915, PLR0911 — branching follows t
                 config_overrides=codex_config_overrides,
                 client_name="harness-mcp",
                 client_title="Harness Generator",
-                client_version="0.1.0",
+                client_version=__version__,
             )
             if AppServerConfig is not None
             else None
@@ -409,7 +417,6 @@ async def chunk_loop(  # noqa: PLR0912, PLR0915, PLR0911 — branching follows t
 
         event_logger = EventLogger(log_path)
         step_count = 0
-        chunk_started = monotonic()
 
         try:
             async with AsyncCodex(config=cfg) as codex:
@@ -426,6 +433,9 @@ async def chunk_loop(  # noqa: PLR0912, PLR0915, PLR0911 — branching follows t
                 )
                 turn = await thread.turn(TextInput(prompt) if TextInput else prompt)
 
+                # Spec §7.2:615 — measure wall-clock from event-stream start so
+                # the reset budget covers agentic work, not SDK init / turn setup.
+                chunk_started = monotonic()
                 async for event in turn.stream():
                     await event_logger.handle(event)
                     if getattr(event, "method", "") == "item/started":

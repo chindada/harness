@@ -281,8 +281,10 @@ async def run_plan_phase(
 ) -> tuple[list[tuple[int, str]], int]:
     """Run the full §5 plan + review loop.
 
-    Returns (sprints, rounds_taken). `rounds_taken` is the number of
-    review-driven revisions, not counting the initial Planner call.
+    Returns (sprints, rounds_taken). Per spec §5.2:334, `rounds_taken`
+    counts every iteration of the review loop — synthetic max_sprints
+    injection, issues-found revision, and the final approving Reviewer
+    round all increment. The initial Planner write does not count.
     Writes the final approved plan to `<job_dir>/plan.md`.
 
     `phase_setter` (if provided) is awaited at every spec §4.4 plan-phase
@@ -332,8 +334,11 @@ async def run_plan_phase(
             )
         if len(sprints) > options.max_sprints:
             # Skip reviewer; inject a synthetic issue and revise.
+            # Spec §5.2:328 — the issue must carry the `[implementation]`
+            # prefix so the issue-tagging filter (§5.2:338) treats it
+            # explicitly, not via the untagged-default fallback.
             last_issues = [
-                f"Plan exceeds max_sprints={options.max_sprints}; "
+                f"[implementation] Plan exceeds max_sprints={options.max_sprints}; "
                 f"consolidate into <={options.max_sprints} sprints."
             ]
             rounds += 1
@@ -365,6 +370,11 @@ async def run_plan_phase(
             # Lock in plan.md.
             plan_text = plan_path.read_text(encoding="utf-8")
             (job_dir / "plan.md").write_text(plan_text, encoding="utf-8")
+            # Spec §5.2:334 — "If status word is `Approved` → exit loop. Copy
+            # `plan-vN.md` → `plan.md`. Increment `plan_review_rounds`."
+            # The approving Reviewer evaluation IS a review round and must
+            # show up in the counter that callers see via poll_build.
+            rounds += 1
             return sprints, rounds
 
         # Revise.

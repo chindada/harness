@@ -21,7 +21,7 @@ from harness_mcp.sprints import (
     run_evaluation,
     run_sprint,
 )
-from harness_mcp.types import EvaluationResult, ImplementationResult
+from harness_mcp.types import Criterion, EvaluationResult, ImplementationResult
 
 
 def _agent_msg(text: str) -> object:
@@ -852,3 +852,123 @@ class TestRunSprint:
         )
         assert result.passed is False
         assert result.error == "contract_not_sealed"
+
+    @pytest.mark.asyncio
+    async def test_persistent_criterion_failure_surfaces_specific_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec §6.4 — when the same criterion fails in ≥ 2 attempts, the
+        terminal error_text must be
+        `criterion_<n>_persistently_unrealizable_under_current_contract`,
+        not the generic `max_sprint_retries_exceeded`. The 1-based <n> is
+        the criterion's position in the most recent eval's combined
+        static+dynamic ordering."""
+
+        async def fake_negotiate(**_kw: Any) -> bool:
+            (_kw["sprint_dir"] / "contract.md").write_text("# Sprint 1\n", encoding="utf-8")
+            return True
+
+        async def fake_chunk_loop(**_kw: Any) -> ImplementationResult:
+            return ImplementationResult(ok=True, commit_sha="abc", summary="done")
+
+        # Both attempts: criterion-A passes, criterion-B fails. B is index 2.
+        async def fake_run_eval(**_kw: Any) -> EvaluationResult:
+            return EvaluationResult(
+                sprint_seq=1,
+                static_criteria=[
+                    Criterion(text="A", result="PASS", evidence="", notes=""),
+                    Criterion(text="B", result="FAIL", evidence="boom", notes="why"),
+                ],
+                dynamic_criteria=[],
+                routing_decision="",
+                passed=False,
+            )
+
+        monkeypatch.setattr(sprints, "negotiate_contract", fake_negotiate)
+        monkeypatch.setattr(sprints, "chunk_loop", fake_chunk_loop)
+        monkeypatch.setattr(sprints, "run_evaluation", fake_run_eval)
+
+        job_dir = tmp_path / "jobs" / "JOBID"
+        job_dir.mkdir(parents=True)
+        (job_dir / "design.md").write_text("D")
+        (job_dir / "plan.md").write_text("## Sprint 1: Title\n")
+
+        result = await run_sprint(
+            job_id="JOBID",
+            sprint_seq=1,
+            sprint_title="Title",
+            job_dir=job_dir,
+            options=JobOptions(max_sprint_retries=1),  # 2 total attempts
+            captured_mcp={"context7": {}},
+            setting_sources=["user"],
+            generator_md="G",
+            evaluator_options_factory=lambda **_kw: object(),
+            codex_bin="/usr/bin/codex",
+            codex_overrides=("sandbox=workspace-write", "approval_policy=never"),
+            prior_tag=None,
+        )
+        assert result.passed is False
+        assert result.error == "criterion_2_persistently_unrealizable_under_current_contract"
+
+    @pytest.mark.asyncio
+    async def test_non_persistent_failure_falls_back_to_generic_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spec §6.4 — if no single criterion fails ≥ 2 attempts (e.g. only
+        one attempt happened, or the failed criteria differ between
+        attempts), do NOT surface the persistent-criterion code; fall back
+        to the existing generic message."""
+        call_count = [0]
+
+        async def fake_negotiate(**_kw: Any) -> bool:
+            (_kw["sprint_dir"] / "contract.md").write_text("# Sprint 1\n", encoding="utf-8")
+            return True
+
+        async def fake_chunk_loop(**_kw: Any) -> ImplementationResult:
+            return ImplementationResult(ok=True, commit_sha="abc", summary="done")
+
+        async def fake_run_eval(**_kw: Any) -> EvaluationResult:
+            # Attempt 1 fails on A; attempt 2 fails on B — no overlap.
+            call_count[0] += 1
+            failing = "A" if call_count[0] == 1 else "B"
+            return EvaluationResult(
+                sprint_seq=1,
+                static_criteria=[
+                    Criterion(
+                        text=t,
+                        result="FAIL" if t == failing else "PASS",
+                        evidence="",
+                        notes="",
+                    )
+                    for t in ("A", "B")
+                ],
+                dynamic_criteria=[],
+                routing_decision="",
+                passed=False,
+            )
+
+        monkeypatch.setattr(sprints, "negotiate_contract", fake_negotiate)
+        monkeypatch.setattr(sprints, "chunk_loop", fake_chunk_loop)
+        monkeypatch.setattr(sprints, "run_evaluation", fake_run_eval)
+
+        job_dir = tmp_path / "jobs" / "JOBID"
+        job_dir.mkdir(parents=True)
+        (job_dir / "design.md").write_text("D")
+        (job_dir / "plan.md").write_text("## Sprint 1: Title\n")
+
+        result = await run_sprint(
+            job_id="JOBID",
+            sprint_seq=1,
+            sprint_title="Title",
+            job_dir=job_dir,
+            options=JobOptions(max_sprint_retries=1),
+            captured_mcp={"context7": {}},
+            setting_sources=["user"],
+            generator_md="G",
+            evaluator_options_factory=lambda **_kw: object(),
+            codex_bin="/usr/bin/codex",
+            codex_overrides=("sandbox=workspace-write", "approval_policy=never"),
+            prior_tag=None,
+        )
+        assert result.passed is False
+        assert result.error == "max_sprint_retries_exceeded"

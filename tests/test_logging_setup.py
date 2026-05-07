@@ -130,3 +130,37 @@ class TestEventLogger:
         # Second close should not raise (file already closed).
         # If it raises, that's a bug we'd notice in the chunk loop's finally block.
         # The contract is: aclose is best-effort; second call is at most a warning.
+
+    @pytest.mark.asyncio
+    async def test_long_tool_result_is_truncated(self, tmp_path: Path) -> None:
+        """Spec §7.3:888 — `result = _truncate(_summarize_item_result(item))`.
+        A multi-kilobyte tool output must be clipped (with ellipsis) before
+        being written to log.txt; nothing in chunk-loop streaming should
+        produce a multi-kilobyte log line."""
+        log = tmp_path / "log.txt"
+        logger = EventLogger(log)
+        # 5KB of output — well past the 200-char default truncation cap.
+        big_output = "x" * 5000
+        item_started = _fake_item("c1", "commandExecution", command="dump")
+        item_completed = _fake_item(
+            "c1", "commandExecution", command="dump", aggregatedOutput=big_output
+        )
+        await logger.handle(
+            FakeEvent(method="item/started", payload=SimpleNamespace(item=item_started))
+        )
+        await logger.handle(
+            FakeEvent(method="item/completed", payload=SimpleNamespace(item=item_completed))
+        )
+        await logger.aclose()
+        lines = _read_log(log)
+        tool_lines = [ln for ln in lines if ln.startswith("[tool:")]
+        assert tool_lines, f"no tool line emitted; lines={lines}"
+        # The full line is `[tool: exec args=dump -> <result>]`. Even with the
+        # framing chars, the whole thing must stay well under the 5KB raw output
+        # — bound it generously at 300 to catch any truncation regression.
+        assert len(tool_lines[0]) < 300, (
+            f"tool result not truncated; line len={len(tool_lines[0])}: "
+            f"{tool_lines[0][:100]}…"
+        )
+        # Ellipsis is the truncation sentinel.
+        assert "…" in tool_lines[0]

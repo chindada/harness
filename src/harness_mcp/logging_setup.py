@@ -90,7 +90,10 @@ class EventLogger:
             item_id = getattr(item, "id", None) if item is not None else None
             start = self._calls.pop(item_id, None) if item_id else None
             if start is not None:
-                result = _summarize_item_result(item)
+                # Spec §7.3:888 — wrap _summarize_item_result in _truncate so the
+                # tool-result side of the log line is always bounded, regardless
+                # of whether _summarize_item_result internally truncates.
+                result = _truncate(_summarize_item_result(item))
                 line = f"[tool: {start.name} args={start.args} -> {result}]"
         elif method in ("turn/started", "turn/completed"):
             turn = getattr(payload, "turn", None) if payload else None

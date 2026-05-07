@@ -312,7 +312,10 @@ class TestRunPlanPhase:
                 planner_options_factory=lambda **_kw: object(),  # opaque; mock doesn't read
                 reviewer_options_factory=lambda **_kw: object(),
             )
-            assert rounds == 0  # 0 review-driven revisions
+            # Spec §5.2:334 — approval increments plan_review_rounds. The
+            # only Reviewer evaluation in this scenario was the approval, so
+            # the count is 1.
+            assert rounds == 1
             assert (job_dir / "plan.md").is_file()
             assert len(sprints) == 3
 
@@ -349,7 +352,9 @@ class TestRunPlanPhase:
                 planner_options_factory=lambda **_kw: object(),
                 reviewer_options_factory=lambda **_kw: object(),
             )
-            assert rounds == 1
+            # Spec §5.2:334 — count includes both the issues-found round
+            # (revision triggered) and the approving round.
+            assert rounds == 2
             assert (job_dir / "plan.md").is_file()
 
     @pytest.mark.asyncio
@@ -442,6 +447,80 @@ class TestRunPlanPhase:
         assert "no test plan" in exc_info.value.error_text
 
     @pytest.mark.asyncio
+    async def test_max_sprints_oversize_injects_implementation_tagged_issue(
+        self, tmp_path: Path
+    ) -> None:
+        """Spec §5.2:328 — the synthetic issue text MUST include the
+        `[implementation]` tag so the issue-tagging filter (§5.2:338) sees
+        it explicitly rather than via the untagged-default fallback."""
+        job_dir = tmp_path / "job"
+        job_dir.mkdir()
+        (job_dir / "design.md").write_text("DESIGN")
+        (job_dir / "plan-history").mkdir()
+
+        oversized = dedent(
+            """
+            # Plan
+            ## Sprint 1: A
+            ## Sprint 2: B
+            ## Sprint 3: C
+            """
+        ).strip()
+        within_cap = dedent(
+            """
+            # Plan
+            ## Sprint 1: AB
+            ## Sprint 2: C
+            """
+        ).strip()
+
+        def write_v1() -> None:
+            (job_dir / "plan-history" / "plan-v1.md").write_text(oversized)
+
+        def write_v2() -> None:
+            (job_dir / "plan-history" / "plan-v2.md").write_text(within_cap)
+
+        def write_review_v2() -> None:
+            (job_dir / "plan-history" / "review-v2.md").write_text(SAMPLE_REVIEW_APPROVED)
+
+        scripts = [
+            (write_v1, [_make_assistant_with_skill_call(), _make_result_msg()]),
+            (write_v2, [_make_assistant_with_skill_call(), _make_result_msg()]),
+            (write_review_v2, [_make_result_msg()]),
+        ]
+
+        # Capture each prompt sent to query() so we can assert the v2
+        # Planner prompt carries the [implementation]-tagged synthetic issue.
+        captured_prompts: list[str] = []
+        call_count = [0]
+
+        async def capturing_query(*_args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+            captured_prompts.append(kwargs.get("prompt", ""))
+            i = call_count[0]
+            call_count[0] += 1
+            side_effect, msgs = scripts[i]
+            side_effect()
+            for m in msgs:
+                yield m
+
+        opts = JobOptions(max_sprints=2)
+        with patch.object(_planning_module, "query", capturing_query):
+            await run_plan_phase(
+                job_dir=job_dir,
+                options=opts,
+                planner_options_factory=lambda **_kw: object(),
+                reviewer_options_factory=lambda **_kw: object(),
+            )
+
+        # The v2 Planner prompt (call index 1) is the revision driven by
+        # the synthetic issue. Spec §5.2:328 requires the tag prefix.
+        v2_prompt = captured_prompts[1]
+        assert "[implementation]" in v2_prompt, (
+            f"v2 Planner prompt missing [implementation] tag; prompt:\n{v2_prompt}"
+        )
+        assert "Plan exceeds max_sprints=2" in v2_prompt
+
+    @pytest.mark.asyncio
     async def test_max_sprints_oversize_skips_reviewer_and_revises(
         self, tmp_path: Path
     ) -> None:
@@ -495,7 +574,9 @@ class TestRunPlanPhase:
                 reviewer_options_factory=lambda **_kw: object(),
             )
         assert len(sprints) == 2
-        assert rounds == 1  # one revision driven by the synthetic issue
+        # Spec §5.2:334 — synthetic max_sprints injection counts (1) +
+        # final approving Reviewer round (1) = 2.
+        assert rounds == 2
         # review-v1.md should NOT exist (Reviewer skipped on oversized plan).
         assert not (job_dir / "plan-history" / "review-v1.md").is_file()
 

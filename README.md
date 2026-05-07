@@ -108,6 +108,16 @@ ANTHROPIC_API_KEY=... harness-mcp serve --transport streamable-http --host 127.0
 - **Codex hangs** — ensure `~/.codex/config.toml` doesn't have `approval_policy=on-request`; the harness forces `never` regardless, so most hangs trace to the binary not exiting on completion.
 - **Playwright tests fail with "browser not found"** — reinstall Playwright browsers via the playwright MCP plugin's install command.
 
+## CI smoke
+
+Run before every commit:
+
+```bash
+uv run ruff check . && uv run ruff format --check . && uv run pytest -k 'not smoke'
+```
+
+Identical line is recommended in a pre-commit hook.
+
 ## Limitations
 
 - Sandbox is best-effort (cwd + system prompt + permission_mode), not OS-level. A determined agent can escape via Bash. For stronger isolation, run harness-mcp inside a container.

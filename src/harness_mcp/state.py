@@ -104,10 +104,25 @@ def _apply_pragmas(conn: sqlite3.Connection) -> None:
 
 
 def init_db() -> None:
-    """Open (or reuse) the module-global writer connection and ensure schema.
+    """Open the module-global writer connection and apply the schema.
 
-    Idempotent — safe to call on every server boot. Creates `~/.harness/`
-    if missing.
+    Design:
+        Per spec §4.2 the harness uses a single writer connection
+        opened once at lifespan startup, with `check_same_thread=False`
+        so `anyio.to_thread.run_sync` can dispatch from any worker
+        thread. Reads use per-coroutine connections (cheap with WAL).
+        Idempotent so it can be called from the doctor CLI as well as
+        the server lifespan without duplicating effort.
+
+    Implementation:
+        Ensures `~/.harness/` and `~/.harness/jobs/` exist (mkdir is
+        idempotent), opens the writer if not yet open, applies the
+        documented PRAGMAs (WAL, synchronous=NORMAL, busy_timeout=5000,
+        foreign_keys=ON), then runs the `CREATE TABLE IF NOT EXISTS`
+        schema and commits.
+
+    Example:
+        >>> init_db()  # called by lifespan; safe to call repeatedly
     """
     global _writer_conn  # noqa: PLW0603 — module-global writer is by design (one writer)
     home = harness_home()
@@ -140,13 +155,51 @@ def _exec_commit(stmt: str, params: tuple) -> int:
 
 
 async def db_write(stmt: str, params: tuple) -> None:
-    """Serialized writer (one thread-trip, WAL + busy_timeout retry)."""
+    """Serialize one write through the module-global writer connection.
+
+    Design:
+        Per spec §4.2 every write goes through the single writer
+        connection. We hold `_writer_lock` for the entire trip so
+        SQLite's busy-timeout retry doesn't have to fight in-process
+        contention; the lock is async so we don't block the event
+        loop while waiting our turn. The write runs on a worker
+        thread via `anyio.to_thread.run_sync` — the C-level
+        `sqlite3.Connection.execute` blocks the calling thread.
+
+    Implementation:
+        `async with _writer_lock` then `to_thread.run_sync` of
+        `_exec_commit` which `execute(stmt, params)` + `commit()` in
+        one trip. No retry on top: SQLite's `busy_timeout=5000`
+        handles concurrent readers cleanly under WAL.
+
+    Example:
+        >>> await db_write("UPDATE jobs SET updated_at=? WHERE id=?", (1, "J"))
+    """
     async with _writer_lock:
         await anyio.to_thread.run_sync(_exec_commit, stmt, params)
 
 
 async def db_write_returning_rowcount(stmt: str, params: tuple) -> int:
-    """Variant that returns affected rowcount; used by the §3.2 CAS UPDATE."""
+    """Like `db_write`, but returns the affected row count for CAS use.
+
+    Design:
+        Per spec §3.2 the orchestrator's pending→running transition is
+        a compare-and-swap UPDATE: `... WHERE id=? AND status='pending'`.
+        The caller uses the rowcount to detect the cancel-wins race
+        (rc=0 means cancel_build flipped the row to 'cancelled' first).
+
+    Implementation:
+        Same lock + thread offload pattern as `db_write`; the only
+        difference is `_exec_commit` returns `cursor.rowcount` and
+        we propagate it.
+
+    Example:
+        >>> rc = await db_write_returning_rowcount(
+        ...     "UPDATE jobs SET status='running' WHERE id=? AND status='pending'",
+        ...     ("J",),
+        ... )
+        >>> 0  # cancel beat us
+    """
     async with _writer_lock:
         return await anyio.to_thread.run_sync(_exec_commit, stmt, params)
 
@@ -182,10 +235,25 @@ def new_job_id() -> str:
 
 
 async def sweep_running_to_interrupted() -> None:
-    """Mark any leftover `running` jobs as `interrupted`.
+    """Spec §10.1 step 6 — flip leftover `running` rows to `interrupted` at startup.
 
-    Called once at server lifespan startup (spec §10.1 step 6). Anything
-    still `running` is leftover from a prior server crash.
+    Design:
+        Workers die with the server (spec §2.1:66). Any row left at
+        `status='running'` after a server restart is by definition
+        orphaned — its orchestrator coroutine no longer exists. We
+        terminalize it as `interrupted` (a distinct status from
+        `cancelled` / `failed`) so callers can distinguish "the harness
+        restarted under you" from "your job hit max_sprint_retries".
+
+    Implementation:
+        Single UPDATE under the writer lock. `finished_at` and
+        `updated_at` are written in the same statement so the row
+        is atomically terminal; `last_message` carries the exact
+        operator-visible string `"server restarted before job could
+        finish"` (spec line 191) — refactors must preserve it.
+
+    Example:
+        >>> await sweep_running_to_interrupted()  # called by run_prereqs at startup
     """
     msg = "server restarted before job could finish"
     await db_write(
