@@ -4,21 +4,50 @@ An MCP server that orchestrates multi-hour, multi-agent application builds from 
 
 ## Setup
 
-1. Install the Codex CLI (https://github.com/openai/codex) and confirm `codex --version` works.
-2. Configure `~/.codex/config.toml` — at minimum set your model. Example:
+1. Install the Codex CLI (https://github.com/openai/codex), confirm `codex --version` works, then configure `~/.codex/config.toml` — at minimum set your model. Example:
 
    ```toml
    model = "claude-sonnet-4-6"
    model_provider = "anthropic"
    ```
 
+2. Clone the repo:
+
+   ```bash
+   git clone git@github.com:chindada/harness.git
+   # or HTTPS: git clone https://github.com/chindada/harness.git
+   cd harness
+   ```
+
 3. Install harness-mcp with uv:
 
    ```bash
-   uv pip install harness-mcp     # or: uv pip install -e . from a checkout
+   uv pip install -e .
    ```
 
-4. Verify everything:
+   First-time install pulls the Codex SDK from a git dependency, so it takes longer than a typical `uv pip install`.
+
+4. Register harness-mcp with Claude Code. Pick one transport.
+
+   **Stdio** (quickstart, lifetime tied to your client). Use for trying it out or short builds.
+
+   ```bash
+   claude mcp add --scope user --transport stdio harness-mcp -- harness-mcp serve --transport stdio
+   ```
+
+   **Streamable-http** (daemon — jobs survive client disconnects). Use for multi-hour builds.
+
+   ```bash
+   # 1. Start the daemon (needs ANTHROPIC_API_KEY in env):
+   ANTHROPIC_API_KEY=... harness-mcp serve --transport streamable-http --host 127.0.0.1 --port 8765
+
+   # 2. In another terminal, register the URL with Claude Code:
+   claude mcp add --scope user --transport http harness-mcp http://127.0.0.1:8765/mcp
+   ```
+
+   `--scope user` registers harness-mcp across all projects (the CLI default `local` is per-project).
+
+5. Verify everything:
 
    ```bash
    harness-mcp doctor
@@ -26,12 +55,29 @@ An MCP server that orchestrates multi-hour, multi-agent application builds from 
 
    Expected: a list of `OK` lines for paths, env, codex, codex-shape, skill, mcp, strict-mcp-config, restart_sweep.
 
+### Manual config (reference)
+
+If you'd rather edit `~/.claude.json` directly, or commit `.mcp.json` to a project repo, here's the equivalent for stdio:
+
+```json
+{
+  "mcpServers": {
+    "harness-mcp": {
+      "command": "harness-mcp",
+      "args": ["serve", "--transport", "stdio"]
+    }
+  }
+}
+```
+
+For streamable-http, point a `url` field at the daemon (see step 4 above for the daemon command).
+
 ## Required environment variables
 
-| Var | Required | Purpose |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | yes | Used by Planner / Reviewer / Evaluator / Summarizer (Claude Agent SDK). |
-| `HARNESS_CODEX_BIN` | no  | Override `which codex`. Useful when codex isn't on PATH. |
+| Var                 | Required | Purpose                                                                 |
+| ------------------- | -------- | ----------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY` | yes      | Used by Planner / Reviewer / Evaluator / Summarizer (Claude Agent SDK). |
+| `HARNESS_CODEX_BIN` | no       | Override `which codex`. Useful when codex isn't on PATH.                |
 
 (Codex auth lives in `~/.codex/auth.json`; no `OPENAI_API_KEY` needed.)
 
@@ -45,37 +91,6 @@ The harness reads these from your existing Claude Code settings (`~/.claude.json
 ## Required skills
 
 - **superpowers:writing-plans** (HARD): used by Planner. Install via the superpowers plugin at user scope.
-
-## Example mcp.json
-
-stdio (default — child process of your MCP client):
-
-```json
-{
-  "mcpServers": {
-    "harness-mcp": {
-      "command": "harness-mcp",
-      "args": ["serve", "--transport", "stdio"]
-    }
-  }
-}
-```
-
-streamable-http (daemon — jobs survive client disconnects):
-
-```bash
-ANTHROPIC_API_KEY=... harness-mcp serve --transport streamable-http --host 127.0.0.1 --port 8765
-```
-
-```json
-{
-  "mcpServers": {
-    "harness-mcp": {
-      "url": "http://127.0.0.1:8765/mcp"
-    }
-  }
-}
-```
 
 ## Quickstart
 
