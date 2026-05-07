@@ -63,10 +63,15 @@ class TestCancelJob:
         result = await cancel_job("J_PEND")
         assert result["ok"] is True
         assert result["was_already_terminal"] is False
-        # DB row reflects the cancel.
+        # DB row reflects the cancel — including the spec'd last_message wording.
         async with open_reader() as r:
-            row = r.execute("SELECT status FROM jobs WHERE id='J_PEND'").fetchone()
+            row = r.execute(
+                "SELECT status, last_message, finished_at, updated_at FROM jobs WHERE id='J_PEND'"
+            ).fetchone()
         assert row[0] == "cancelled"
+        assert row[1] == "cancelled by user before orchestrator started"
+        assert row[2] is not None  # finished_at set
+        assert row[3] is not None  # updated_at set
 
     @pytest.mark.asyncio
     async def test_running_job_scope_cancelled(self, db: Path) -> None:
@@ -82,6 +87,11 @@ class TestCancelJob:
         assert scope.cancel_called
 
         async with open_reader() as r:
-            row = r.execute("SELECT status, last_message FROM jobs WHERE id='J_RUN'").fetchone()
+            row = r.execute(
+                "SELECT status, last_message, finished_at, updated_at FROM jobs WHERE id='J_RUN'"
+            ).fetchone()
         assert row[0] == "cancelled"
+        assert row[1] == "cancelled by user"
+        assert row[2] is not None  # finished_at set
+        assert row[3] is not None  # updated_at set
         await unregister_scope("J_RUN")

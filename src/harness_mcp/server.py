@@ -8,6 +8,7 @@ state so the lower-level modules don't need it.
 
 from __future__ import annotations
 
+import functools
 import os
 import shutil
 from collections.abc import AsyncIterator, Callable
@@ -65,6 +66,29 @@ def _to_call_tool_error(exc: Exception) -> mcp_types.CallToolResult:
         content=[mcp_types.TextContent(type="text", text=f"{code}: {exc}")],
         structuredContent={"code": code, "message": str(exc)},
     )
+
+
+def _map_harness_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Decorator: catch HarnessToolError raised inside an MCP tool body and
+    return a CallToolResult with structured `code` set per spec §3.1.
+
+    Both FastMCP's `convert_result` (utilities/func_metadata.py) and the
+    lowlevel server's call_tool handler pass `CallToolResult` through unchanged,
+    so returning one short-circuits FastMCP's default exception → string-message
+    flow and preserves `structured_content.code`.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(
+        *args: Any,  # noqa: ANN401
+        **kwargs: Any,  # noqa: ANN401
+    ) -> Any:  # noqa: ANN401
+        try:
+            return await fn(*args, **kwargs)
+        except HarnessToolError as e:
+            return _to_call_tool_error(e)
+
+    return wrapper
 
 
 # ---------- options factories ----------
@@ -201,6 +225,7 @@ server = FastMCP("harness-mcp", lifespan=lifespan)
 
 
 @server.tool()
+@_map_harness_errors
 async def start_build(
     design_doc_path: str, options: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -238,6 +263,7 @@ async def start_build(
 
 
 @server.tool()
+@_map_harness_errors
 async def poll_build(job_id: str) -> dict[str, Any]:
     async with open_reader() as r:
         row = r.execute(
@@ -263,6 +289,7 @@ async def poll_build(job_id: str) -> dict[str, Any]:
 
 
 @server.tool()
+@_map_harness_errors
 async def get_build_result(job_id: str) -> dict[str, Any]:
     async with open_reader() as r:
         row = r.execute(
@@ -301,5 +328,6 @@ async def get_build_result(job_id: str) -> dict[str, Any]:
 
 
 @server.tool()
+@_map_harness_errors
 async def cancel_build(job_id: str) -> dict[str, Any]:
     return await cancel_job(job_id)

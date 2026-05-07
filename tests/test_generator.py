@@ -242,6 +242,20 @@ class TestCommitAndSummarize:
         )
         assert "harness/JOBID/sprint-1" in tags.stdout
 
+        # Spec §7.4: tag MUST be annotated (so collision narrowing works
+        # against `git rev-parse <tag>^{tag}` later). `cat-file -t` returns
+        # "tag" for annotated, "commit" for lightweight.
+        tag_type = subprocess.run(  # noqa: ASYNC221 — test-only inspection
+            ["git", "cat-file", "-t", "harness/JOBID/sprint-1"],
+            cwd=str(app_repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert tag_type.stdout.strip() == "tag", (
+            f"sprint tag must be annotated; got {tag_type.stdout!r}"
+        )
+
     @pytest.mark.asyncio
     async def test_no_changes_to_commit_still_tags(self, app_repo: Path) -> None:
         # Initial empty commit so HEAD exists.

@@ -15,6 +15,7 @@ Layer 2 (this file's second half, added in Task 2):
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -25,6 +26,8 @@ from harness_mcp.config import JobOptions
 from harness_mcp.types import (
     HarnessToolError,
 )
+
+logger = logging.getLogger(__name__)
 
 # The SDK is imported lazily so unit tests can swap `query` via monkeypatch
 # without making it a hard import (and to keep the module fast to import).
@@ -89,7 +92,16 @@ def parse_review(review_path: Path) -> ReviewResult:
             bullet = m.group(1).strip()
             if _DESIGN_TAG_RE.match(bullet):
                 continue  # drop [design] issues
+            had_impl_tag = bool(_IMPL_TAG_RE.match(bullet))
             stripped = _IMPL_TAG_RE.sub("", bullet)  # strip [implementation] prefix
+            if not had_impl_tag:
+                # Spec §5.2: untagged issues default to [implementation]; warn the
+                # operator so a Reviewer that omits tags can be caught and corrected.
+                logger.warning(
+                    "review %s: untagged issue defaulted to [implementation]: %s",
+                    review_path.name,
+                    stripped[:120],
+                )
             issues.append(stripped.strip())
             if len(issues) >= _MAX_FORWARDED_ISSUES:
                 break

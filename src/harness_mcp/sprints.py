@@ -6,6 +6,7 @@ Stage 1 here. Stages 2-4 added in Tasks 2-3.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sys
 from collections.abc import Callable
@@ -30,6 +31,8 @@ from harness_mcp.types import (
     EvaluatorEmittedUnparseableEvalMdError,
     HarnessToolError,
 )
+
+logger = logging.getLogger(__name__)
 
 # Lazy SDK imports so unit tests can monkeypatch.
 try:
@@ -225,6 +228,22 @@ async def negotiate_contract(
                 f"sprint {sprint_seq}: contract_negotiation_no_progress (both bodies empty)"
             )
 
+        # Spec §6.1: log one-sided empty bodies (still counts toward max rounds).
+        if not gen_body:
+            logger.warning(
+                "sprint %d round %d: Generator emitted empty body; "
+                "treating as no-op (counts toward max_contract_negotiation_rounds)",
+                sprint_seq,
+                n + 1,
+            )
+        if not eval_body:
+            logger.warning(
+                "sprint %d round %d: Evaluator emitted empty body; "
+                "treating as no-op (counts toward max_contract_negotiation_rounds)",
+                sprint_seq,
+                n + 1,
+            )
+
         if gen_body:
             append_round_atomic(contract_path, f"\n## Round {n + 1} — Generator\n", gen_body + "\n")
         if eval_body:
@@ -397,6 +416,12 @@ async def run_sprint(
     plan_section_text = _slice_plan_section(plan_text, sprint_seq)
     log_path = sprint_dir / "log.txt"
 
+    # Spec §7.0 Shape 2: the first chunk's prompt requires the sprint's plan
+    # section verbatim. Materialize it on disk so chunk_loop can pass the path
+    # down to build_chunk_prompt (the SDK reads via Path, not text).
+    plan_section_file = sprint_dir / "plan_section.md"
+    plan_section_file.write_text(plan_section_text, encoding="utf-8")
+
     attempts = 0
     eval_md_for_retry: Path | None = None
 
@@ -431,7 +456,7 @@ async def run_sprint(
                     sprint_dir=sprint_dir,
                     contract_path=contract_path,
                     design_path=(job_dir / "design.md"),
-                    plan_section_path=None,  # we inline plan_section_text already in contract
+                    plan_section_path=plan_section_file,
                     log_path=log_path,
                     options=options,
                     generator_md_text=generator_md,

@@ -178,10 +178,13 @@ class TestRestartSweep:
         await sweep_running_to_interrupted()
         async with open_reader() as r:
             r1 = r.execute(
-                "SELECT status, last_message, finished_at FROM jobs WHERE id='S1'"
+                "SELECT status, last_message, finished_at, updated_at FROM jobs WHERE id='S1'"
             ).fetchone()
             r2 = r.execute("SELECT status FROM jobs WHERE id='S2'").fetchone()
         assert r1[0] == "interrupted"
-        assert r1[1] is not None
-        assert r1[2] is not None
+        # Spec §4.x / §10.1 step 6 — exact wording so a future refactor can't
+        # silently change the operator-visible message.
+        assert r1[1] == "server restarted before job could finish"
+        assert r1[2] is not None  # finished_at
+        assert r1[3] is not None  # updated_at
         assert r2[0] == "pending"  # untouched
