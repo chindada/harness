@@ -12,6 +12,7 @@ async + subprocess via the SDK; layer 4 shells out to git.
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 from pathlib import Path
@@ -34,6 +35,8 @@ from harness_mcp.types import (
     HandoffParseError,
     ImplementationResult,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------- Layer 1: parse_handoff ----------
 
@@ -136,7 +139,10 @@ def build_chunk_prompt(
     handoff_path: Path,
     chunk_seq: int,
 ) -> str:
-    """Build one of four prompt shapes per spec §7.0.
+    """Build one of three implementation-prompt shapes (Shapes 2-4) per spec §7.0.
+
+    Shape 1 (contract-negotiation) is assembled in `sprints.negotiate_contract`;
+    this function only handles the chunk-loop's implementation shapes.
 
     Selection rules:
       * eval_md_for_retry given          → Shape 4 (retry)
@@ -333,7 +339,7 @@ def _commit_and_tag_sync(
 # ---------- Layer 3: chunk_loop ----------
 
 
-async def chunk_loop(
+async def chunk_loop(  # noqa: PLR0912 — branching follows the §7 chunk-loop state machine
     *,
     app_dir: Path,
     sprint_dir: Path,
@@ -417,11 +423,43 @@ async def chunk_loop(
         # Parse handoff. Malformed = warn, fresh-start, count toward cap.
         try:
             handoff = parse_handoff(handoff_path)
-        except HandoffParseError:
+        except HandoffParseError as parse_err:
             if chunk_seq < options.max_codex_chunks_per_sprint:
+                logger.warning(
+                    "chunk %d: handoff malformed (%s); continuing fresh",
+                    chunk_seq,
+                    parse_err,
+                )
                 prev_handoff = None
                 chunk_seq += 1
                 continue
+            # Spec §7 cap-boundary salvage: if the malformed handoff's tail still
+            # declares Status=done, synthesize a Handoff and commit so we don't
+            # waste the chunk's work on a parse-only error.
+            if handoff_path.is_file():
+                tail = handoff_path.read_text(encoding="utf-8", errors="replace")[-2048:]
+                if re.search(r"^## Status\s*\n+\s*done\s*$", tail, re.MULTILINE):
+                    logger.warning(
+                        "chunk %d: handoff malformed but Status=done detected; salvaging",
+                        chunk_seq,
+                    )
+                    synthetic = Handoff(
+                        chunk_seq=chunk_seq,
+                        status="done",
+                        summary=f"sprint {sprint_seq} (salvaged)",
+                        work_done=[],
+                        decisions=[],
+                        files_touched=[],
+                        open_questions=[],
+                        next_steps=[],
+                        declares_done=True,
+                    )
+                    try:
+                        return await commit_and_summarize(
+                            app_dir, synthetic, sprint_seq=sprint_seq, job_id=job_id
+                        )
+                    except CommitFailedError as ce:
+                        return ImplementationResult(ok=False, error=f"commit_failed: {ce}")
             return ImplementationResult(ok=False, error="handoff_persistently_malformed")
 
         if handoff.declares_done:

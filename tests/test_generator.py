@@ -472,3 +472,67 @@ class TestChunkLoop:
         )
         assert result.ok is False
         assert "chunk_cap" in (result.error or "") or "exhausted" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_cap_boundary_salvage_when_status_done(
+        self, app_repo: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Spec §7: malformed handoff at the chunk cap should salvage if its
+        tail still declares Status=done — synthesize a Handoff and commit."""
+        sprint_dir = tmp_path / "sprint-1"
+        sprint_dir.mkdir()
+        (sprint_dir / "contract.md").write_text("CONTRACT")
+
+        @asynccontextmanager
+        async def fake_async_codex(*_a: object, **_kw: object) -> AsyncIterator[object]:
+            class _T:
+                async def turn(self, _input: object) -> FakeTurn:
+                    # Codex wrote real work into the repo this chunk.
+                    (app_repo / "salvage.py").write_text("ok\n", encoding="utf-8")
+                    # Write a deliberately MALFORMED handoff: status block has
+                    # trailing junk so parse_handoff rejects (status_body is
+                    # multi-line, not exactly "done"), but the tail regex
+                    # `^## Status\s*\n+\s*done\s*$` still matches the "done"
+                    # line. That's the salvage condition per spec §7.
+                    handoff_path = sprint_dir / "handoff-001.md"
+                    handoff_path.write_text(
+                        "## Status\n\ndone\n\nstray trailing junk that breaks parse\n",
+                        encoding="utf-8",
+                    )
+                    return FakeTurn(events=[_agent_message("..."), _turn_completed()])
+
+            class _Wrap:
+                async def thread_start(self) -> _T:
+                    return _T()
+
+            yield _Wrap()
+
+        monkeypatch.setattr(gen_mod, "AsyncCodex", fake_async_codex)
+
+        # max_codex_chunks_per_sprint=1 forces the very first chunk to hit the
+        # cap-boundary path on its malformed handoff.
+        opts = JobOptions(codex_reset_steps=2, codex_reset_minutes=1, max_codex_chunks_per_sprint=1)
+        result = await chunk_loop(
+            app_dir=app_repo,
+            sprint_dir=sprint_dir,
+            contract_path=sprint_dir / "contract.md",
+            design_path=None,
+            plan_section_path=None,
+            log_path=sprint_dir / "log.txt",
+            options=opts,
+            generator_md_text="G",
+            sprint_seq=1,
+            job_id="JOBID",
+            eval_md_for_retry=None,
+        )
+        assert result.ok is True, f"salvage failed: {result.error}"
+        assert "salvaged" in (result.summary or "")
+        # Tag should still be created.
+        tags = subprocess.run(  # noqa: ASYNC221 — test-only inspection
+            ["git", "tag", "--list", "harness/JOBID/sprint-1"],
+            cwd=str(app_repo),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "harness/JOBID/sprint-1" in tags.stdout

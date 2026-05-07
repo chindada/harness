@@ -168,12 +168,19 @@ async def run_job(
 
             # Plan phase.
             generator_md = _resolved_prompt_text("generator.md")
-            sprints, _rounds = await run_plan_phase(
+            sprints, plan_review_rounds = await run_plan_phase(
                 job_dir=job_dir,
                 options=options,
                 planner_options_factory=planner_options_factory,
                 reviewer_options_factory=reviewer_options_factory,
                 log_path=log_path,
+            )
+
+            # Spec §5.2 / §6.6: persist the review-round count so poll_build
+            # and get_build_result reflect actual revisions, not always 0.
+            await db_write(
+                "UPDATE jobs SET plan_review_rounds=?, updated_at=? WHERE id=?",
+                (plan_review_rounds, now_ms(), job_id),
             )
 
             # Insert sprint rows.
@@ -244,7 +251,9 @@ async def run_job(
             await db_write(
                 "UPDATE jobs SET status='completed', current_phase='done', last_message=?, "
                 "finished_at=?, updated_at=? WHERE id=?",
-                (summary[:500], now_ms(), now_ms(), job_id),
+                # Spec §6.6: store the summary verbatim. The summarizer prompt
+                # caps prose at 2-3 sentences, so no truncation is needed.
+                (summary, now_ms(), now_ms(), job_id),
             )
         except anyio.get_cancelled_exc_class():
             # Cancellation: the cancel_job handler already wrote the terminal row.

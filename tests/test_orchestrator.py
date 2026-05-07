@@ -74,6 +74,23 @@ class TestCancelJob:
         assert row[3] is not None  # updated_at set
 
     @pytest.mark.asyncio
+    async def test_cancel_is_idempotent(self, db: Path) -> None:
+        """Spec §3.2: calling cancel_build twice on the same job is safe;
+        the second call returns was_already_terminal=True."""
+        await db_write(
+            "INSERT INTO jobs (id, status, current_phase, design_path, options_json, "
+            "started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("J_IDEM", "pending", "init", "/x", "{}", 1, 1),
+        )
+        first = await cancel_job("J_IDEM")
+        assert first["ok"] is True
+        assert first["was_already_terminal"] is False
+
+        # Second cancel: row is now in `cancelled` (terminal) — must short-circuit.
+        second = await cancel_job("J_IDEM")
+        assert second == {"ok": True, "was_already_terminal": True}
+
+    @pytest.mark.asyncio
     async def test_running_job_scope_cancelled(self, db: Path) -> None:
         await db_write(
             "INSERT INTO jobs (id, status, current_phase, design_path, options_json, "
