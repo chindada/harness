@@ -1,0 +1,8 @@
+# Editor / agent / tooling state
+.claude/
+.gemini/
+.vscode/
+.harness/
+.superpowers/
+.playwright-mcp/
+
