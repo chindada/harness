@@ -146,6 +146,25 @@ def check_codex_binary() -> str:
     return f"OK codex: {proc.stdout.strip() or '(no version output)'}{config_note}"
 
 
+def check_claude_binary() -> str:
+    """Resolve $HARNESS_CLAUDE_BIN or `which claude`. Validate it's a real file.
+
+    Multi-account users set HARNESS_CLAUDE_BIN to pin which `claude` install
+    the harness uses, independent of PATH or shell aliases. Skips a `--version`
+    invocation (unlike check_codex_binary) because `claude --version` can be slow
+    and may surface auth prompts; existence + executability is the right level
+    of check, matching what the SDK validates internally before spawning.
+    """
+    bin_path = os.environ.get("HARNESS_CLAUDE_BIN") or shutil.which("claude")
+    if not bin_path:
+        raise PrereqFailedError(
+            "Claude Code CLI not found: set HARNESS_CLAUDE_BIN or add claude to PATH"
+        )
+    if not Path(bin_path).is_file() and shutil.which(bin_path) is None:
+        raise PrereqFailedError(f"Claude Code CLI {bin_path!r} does not exist")
+    return f"OK claude: {bin_path}"
+
+
 async def sweep_at_startup() -> str:
     """Mark any leftover `running` jobs as `interrupted`."""
     await sweep_running_to_interrupted()
@@ -392,6 +411,9 @@ async def run_prereqs(
 
     msg = check_codex_binary()
     report.add("codex_binary", "OK", msg)
+
+    msg = check_claude_binary()
+    report.add("claude_binary", "OK", msg)
 
     codex_msg, codex_overrides = await probe_codex_sdk_shape()
     report.add("codex_sdk_shape", "OK", codex_msg)

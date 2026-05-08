@@ -15,6 +15,7 @@ from harness_mcp.prereqs import (
     DoctorReport,
     PrereqFailedError,
     assert_strict_mcp_config_works,
+    check_claude_binary,
     check_codex_binary,
     check_env,
     check_paths_and_db,
@@ -125,6 +126,45 @@ class TestCheckCodexBinary:
         msg = check_codex_binary()
         assert msg.startswith("OK codex:")
         assert "warning" not in msg.lower()
+
+
+class TestCheckClaudeBinary:
+    def test_uses_harness_claude_bin_env(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        fake_bin = tmp_path / "fake_claude.sh"
+        fake_bin.write_text("#!/bin/sh\nexit 0\n")
+        fake_bin.chmod(0o755)
+        monkeypatch.setenv("HARNESS_CLAUDE_BIN", str(fake_bin))
+
+        msg = check_claude_binary()
+        assert msg.startswith("OK")
+        assert str(fake_bin) in msg
+
+    def test_uses_path_when_env_unset(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.delenv("HARNESS_CLAUDE_BIN", raising=False)
+        fake_bin = tmp_path / "claude"
+        fake_bin.write_text("#!/bin/sh\nexit 0\n")
+        fake_bin.chmod(0o755)
+        monkeypatch.setenv("PATH", str(tmp_path))
+
+        msg = check_claude_binary()
+        assert msg.startswith("OK")
+        assert str(fake_bin) in msg
+
+    def test_fails_when_env_points_at_nonexistent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HARNESS_CLAUDE_BIN", "/nonexistent/claude")
+        monkeypatch.setenv("PATH", "")
+        with pytest.raises(PrereqFailedError):
+            check_claude_binary()
+
+    def test_fails_when_neither_env_nor_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("HARNESS_CLAUDE_BIN", raising=False)
+        monkeypatch.setenv("PATH", "")
+        with pytest.raises(PrereqFailedError):
+            check_claude_binary()
 
 
 class TestSweepAtStartup:

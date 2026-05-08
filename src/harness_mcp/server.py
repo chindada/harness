@@ -98,13 +98,28 @@ def _map_harness_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
 def _resolve_claude_cli() -> str | None:
     """Return the user's PATH `claude` so the SDK doesn't fall back to its bundled binary.
 
-    The SDK ships a `_bundled/claude` and prefers it over PATH. That bundled install
-    has no plugins, so probing for plugin-provided skills (e.g., superpowers:writing-plans)
-    reports them missing. Setting cli_path on ClaudeAgentOptions bypasses the bundled
-    choice. Returns None if `claude` isn't on PATH; the SDK then falls back to its own
-    resolver (no regression for users who never had `claude` on PATH anyway).
+    HARNESS_CLAUDE_BIN wins; falls back to PATH. The SDK ships a `_bundled/claude`
+    and prefers it over PATH; setting cli_path on ClaudeAgentOptions bypasses that
+    so the spawned claude has the user's plugins. Multi-account users set
+    HARNESS_CLAUDE_BIN to pin a specific install regardless of PATH.
+
+    Returns None if neither env nor PATH yields anything; the SDK then falls back
+    to its own resolver (no regression for users who never had `claude` on PATH).
     """
-    return shutil.which("claude")
+    return os.environ.get("HARNESS_CLAUDE_BIN") or shutil.which("claude")
+
+
+def _claude_env_overrides() -> dict[str, str]:
+    """Env overrides spliced into ClaudeAgentOptions.env for the spawned claude.
+
+    Per SDK behavior (subprocess_cli.py:430-455), options.env always wins over
+    inherited env. So HARNESS_CLAUDE_CONFIG_DIR pins the spawned claude's config
+    dir even if the launching parent had a different CLAUDE_CONFIG_DIR.
+    """
+    overrides: dict[str, str] = {}
+    if cdir := os.environ.get("HARNESS_CLAUDE_CONFIG_DIR"):
+        overrides["CLAUDE_CONFIG_DIR"] = cdir
+    return overrides
 
 
 # ---------- options factories ----------
@@ -126,6 +141,7 @@ def _make_planner_options_factory(
             extra_args={"strict-mcp-config": None},
             permission_mode="acceptEdits",
             cli_path=_resolve_claude_cli(),
+            env=_claude_env_overrides(),
         )
 
     return _factory
@@ -147,6 +163,7 @@ def _make_reviewer_options_factory(
             extra_args={"strict-mcp-config": None},
             permission_mode="acceptEdits",
             cli_path=_resolve_claude_cli(),
+            env=_claude_env_overrides(),
         )
 
     return _factory
@@ -176,6 +193,7 @@ def _make_evaluator_options_factory(
             extra_args={"strict-mcp-config": None},
             permission_mode="acceptEdits",
             cli_path=_resolve_claude_cli(),
+            env=_claude_env_overrides(),
         )
 
     return _factory
@@ -195,6 +213,7 @@ def _make_summarizer_options_factory(prereqs_result: PrereqsResult) -> Callable[
             extra_args={"strict-mcp-config": None},
             permission_mode="acceptEdits",
             cli_path=_resolve_claude_cli(),
+            env=_claude_env_overrides(),
         )
 
     return _factory
@@ -223,6 +242,7 @@ def _client_factory(**kw: Any) -> Any:  # noqa: ANN401
     )
 
     kw.setdefault("cli_path", _resolve_claude_cli())
+    kw.setdefault("env", _claude_env_overrides())
     options = ClaudeAgentOptions(**kw)
     return ClaudeSDKClient(options=options)
 

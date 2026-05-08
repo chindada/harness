@@ -14,6 +14,7 @@ Module-level imports:
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -93,8 +94,12 @@ async def _run(payload: dict[str, Any]) -> int:
         mcp_servers=cast(Any, {name: dict(stanza) for name, stanza in captured_mcp.items()}),
         extra_args={"strict-mcp-config": None},
         permission_mode="bypassPermissions",
-        # Override the SDK's bundled-CLI default; mirrors server._resolve_claude_cli().
-        cli_path=shutil.which("claude"),
+        # Mirror server._resolve_claude_cli() and _claude_env_overrides(); kept inline
+        # because evaluator_runner's allowed-import list forbids importing from server.py.
+        cli_path=os.environ.get("HARNESS_CLAUDE_BIN") or shutil.which("claude"),
+        env=(
+            {"CLAUDE_CONFIG_DIR": v} if (v := os.environ.get("HARNESS_CLAUDE_CONFIG_DIR")) else {}
+        ),
     )
 
     with anyio.fail_after(max_eval_seconds):

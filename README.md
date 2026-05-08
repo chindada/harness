@@ -47,13 +47,23 @@ An MCP server that orchestrates multi-hour, multi-agent application builds from 
 
    `--scope user` registers harness-mcp across all projects (the CLI default `local` is per-project).
 
+   **Passing environment overrides to harness-mcp** (e.g., `HARNESS_CLAUDE_BIN`, `HARNESS_CLAUDE_CONFIG_DIR`, `ANTHROPIC_API_KEY` — see the table below):
+
+   ```bash
+   # Stdio: pass with `-e KEY=value` before `--`; claude mcp add stores them with the registration.
+   claude mcp add --scope user --transport stdio harness-mcp -e HARNESS_CLAUDE_BIN=$HOME/.local/bin/claude -- harness-mcp serve --transport stdio
+
+   # Streamable-http: set them when launching the daemon; the registration line stays unchanged.
+   HARNESS_CLAUDE_BIN=$HOME/.local/bin/claude harness-mcp serve --transport streamable-http --host 127.0.0.1 --port 8765
+   ```
+
 5. Verify everything:
 
    ```bash
    harness-mcp doctor
    ```
 
-   Expected: a list of `OK` lines for paths, env, codex, codex-shape, skill, mcp, strict-mcp-config, restart_sweep.
+   Expected: a list of `OK` lines for paths, env, codex, claude, codex-shape, skill, mcp, strict-mcp-config, restart_sweep.
 
 ### Manual config (reference)
 
@@ -74,10 +84,12 @@ For streamable-http, point a `url` field at the daemon (see step 4 above for the
 
 ## Required environment variables
 
-| Var                 | Required | Purpose                                                                 |
-| ------------------- | -------- | ----------------------------------------------------------------------- |
-| `ANTHROPIC_API_KEY` | no       | Used by Planner / Reviewer / Evaluator / Summarizer (Claude Agent SDK). |
-| `HARNESS_CODEX_BIN` | no       | Override `which codex`. Useful when codex isn't on PATH.                |
+| Var                         | Required | Purpose                                                                                                                                                   |
+| --------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`         | no       | Used by Planner / Reviewer / Evaluator / Summarizer (Claude Agent SDK).                                                                                   |
+| `HARNESS_CODEX_BIN`         | no       | Override `which codex`. Useful when codex isn't on PATH.                                                                                                  |
+| `HARNESS_CLAUDE_BIN`        | no       | Override `which claude` for the Claude Agent SDK. Useful for multi-account setups.                                                                        |
+| `HARNESS_CLAUDE_CONFIG_DIR` | no       | Override `CLAUDE_CONFIG_DIR` passed to the spawned `claude`. Pins which Claude account/config the harness uses, regardless of the shell that launched it. |
 
 (Codex auth lives in `~/.codex/auth.json`; no `OPENAI_API_KEY` needed. If `ANTHROPIC_API_KEY` is unset, the Claude Agent SDK falls back to Claude Code CLI auth — system keychain on macOS, or `~/.claude/.credentials.json` on Linux/Windows. Verify with `claude auth status`.)
 
@@ -122,6 +134,7 @@ The harness reads these from your existing Claude Code settings (`~/.claude.json
 - **"context7 not connected"** — check Claude Code's MCP config; `harness-mcp doctor` shows the resolution path.
 - **Codex hangs** — ensure `~/.codex/config.toml` doesn't have `approval_policy=on-request`; the harness forces `never` regardless, so most hangs trace to the binary not exiting on completion.
 - **Playwright tests fail with "browser not found"** — reinstall Playwright browsers via the playwright MCP plugin's install command.
+- **Skill probe finds the wrong account's plugins, or `claude_binary` resolves to the wrong install** — set `HARNESS_CLAUDE_CONFIG_DIR` and/or `HARNESS_CLAUDE_BIN` to pin which Claude account the harness uses. Example: `claude mcp add --scope user --transport stdio harness-mcp -e HARNESS_CLAUDE_CONFIG_DIR=$HOME/.claude-acct2 -e HARNESS_CLAUDE_BIN=$HOME/.claude-acct2/bin/claude -- harness-mcp serve --transport stdio`.
 
 ## CI smoke
 
