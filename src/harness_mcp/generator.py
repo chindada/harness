@@ -19,7 +19,8 @@ from pathlib import Path
 from time import monotonic
 
 from anyio import to_thread
-from codex_app_server import AppServerConfig, AsyncCodex, TextInput
+from codex_app_server import AppServerConfig, AsyncCodex, SandboxPolicy, TextInput
+from codex_app_server.generated.v2_all import AbsolutePathBuf, WorkspaceWriteSandboxPolicy
 
 from harness_mcp import __version__
 from harness_mcp.config import JobOptions
@@ -422,7 +423,16 @@ async def chunk_loop(  # noqa: PLR0912, PLR0915, PLR0911 — branching follows t
                     handoff_path=handoff_path,
                     chunk_seq=chunk_seq,
                 )
-                turn = await thread.turn(TextInput(prompt))
+                turn = await thread.turn(
+                    TextInput(prompt),
+                    sandbox_policy=SandboxPolicy(
+                        root=WorkspaceWriteSandboxPolicy(
+                            type="workspaceWrite",
+                            writable_roots=[AbsolutePathBuf(str(sprint_dir))],
+                            network_access=True,
+                        )
+                    ),
+                )
 
                 # Spec §7.2:615 — measure wall-clock from event-stream start so
                 # the reset budget covers agentic work, not SDK init / turn setup.
