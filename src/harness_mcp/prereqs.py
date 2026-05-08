@@ -309,7 +309,17 @@ async def probe_mcp_servers(
       2. For names without inline config but `connected`, fall back to
          parsing user config files via mcp_capture.parse_user_config_files.
       3. context7 missing -> PrereqFailedError. playwright missing -> warning.
+
+    Plugin-provided MCP servers are reported by the SDK as
+    ``plugin:<plugin>:<server>`` (e.g., ``plugin:playwright:playwright``);
+    we treat the plugin-prefixed form of playwright as an alias for the bare
+    name so downstream consumers see a canonical key.
     """
+    # SDK alias for the plugin-provided playwright MCP. Hardcoded because
+    # playwright is the only plugin we currently care about; if more arrive,
+    # generalize to a small alias map.
+    playwright_plugin_name = "plugin:playwright:playwright"
+
     client = client_factory()
     async with client as c:
         await c.query("ready?")
@@ -317,16 +327,20 @@ async def probe_mcp_servers(
             break
         status = await c.get_mcp_status()
 
-    want = ("context7", "playwright")
+    want = ("context7", "playwright", playwright_plugin_name)
     captured = capture_from_mcp_status(status, want=want)
+    # Normalize plugin-form playwright to canonical name.
+    if playwright_plugin_name in captured:
+        captured.setdefault("playwright", captured.pop(playwright_plugin_name))
 
-    missing_with_inline = [
-        e["name"]
-        for e in status.get("mcpServers", [])
-        if e.get("name") in want
-        and e.get("status") == "connected"
-        and e.get("name") not in captured
-    ]
+    missing_with_inline: list[str] = []
+    for e in status.get("mcpServers", []) or []:
+        raw = e.get("name")
+        if raw not in want or e.get("status") != "connected":
+            continue
+        canonical = "playwright" if raw == playwright_plugin_name else raw
+        if canonical not in captured:
+            missing_with_inline.append(canonical)
     if missing_with_inline:
         captured.update(
             parse_user_config_files(tuple(missing_with_inline), project_root=project_root)

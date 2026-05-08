@@ -19,6 +19,23 @@ from pathlib import Path
 from typing import Any
 
 
+def _user_claude_json_path() -> Path:
+    """Resolve the path to the user-scope ``.claude.json`` config file.
+
+    Mirrors SDK convention: ``$CLAUDE_CONFIG_DIR/.claude.json`` if the env var
+    is set, else ``~/.claude.json``. ``HARNESS_CLAUDE_CONFIG_DIR`` overrides
+    both — same precedence as in server.py / evaluator_runner.py so file-based
+    fallback aligns with the spawned claude's config dir for multi-account
+    setups (e.g., users whose interactive shell aliases set ``CLAUDE_CONFIG_DIR``).
+    """
+    if d := os.environ.get("HARNESS_CLAUDE_CONFIG_DIR"):
+        return Path(d) / ".claude.json"
+    if d := os.environ.get("CLAUDE_CONFIG_DIR"):
+        return Path(d) / ".claude.json"
+    home = Path(os.environ.get("HOME", str(Path.home())))
+    return home / ".claude.json"
+
+
 def capture_from_mcp_status(
     status: dict[str, Any], *, want: tuple[str, ...]
 ) -> dict[str, dict[str, Any]]:
@@ -65,7 +82,7 @@ def parse_user_config_files(  # noqa: PLR0912, PLR0915 — sequence of distinct 
             if isinstance(entry, dict):
                 found[name] = entry
 
-    user_claude = home / ".claude.json"
+    user_claude = _user_claude_json_path()
     if user_claude.is_file():
         try:
             data = json.loads(user_claude.read_text(encoding="utf-8"))

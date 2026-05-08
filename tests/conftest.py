@@ -10,6 +10,21 @@ import pytest
 from harness_mcp import config as cfg
 
 
+@pytest.fixture(autouse=True)
+def _isolate_claude_config_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear claude-config env vars so the host shell can't leak into tests.
+
+    `parse_user_config_files` and `_resolve_claude_cli` honor
+    ``HARNESS_CLAUDE_CONFIG_DIR`` and ``CLAUDE_CONFIG_DIR``; if either is set
+    in the developer's shell (e.g., via an alias), tests that monkeypatch
+    ``HOME`` to a tmp dir would still read the real user config. Auto-clearing
+    these vars ensures hermetic tests; individual tests can re-set them
+    explicitly when needed.
+    """
+    monkeypatch.delenv("HARNESS_CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+
 @pytest.fixture
 def tmp_harness_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """Redirect `~/.harness/` to a per-test tmp directory.
