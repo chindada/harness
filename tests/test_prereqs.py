@@ -354,6 +354,62 @@ class TestProbeSkill:
         assert msg.startswith("OK")
 
     @pytest.mark.asyncio
+    async def test_finds_skill_via_bare_name_and_plugin_tag_in_description(self) -> None:
+        # Realistic format the live SDK returns for superpowers commands:
+        # bare skill name + plugin identified in description as "(plugin-name)".
+        client = _FakeClient(
+            server_info={
+                "commands": [
+                    {
+                        "name": "writing-plans",
+                        "description": (
+                            "(superpowers) Use when you have a spec or requirements "
+                            "for a multi-step task, before touching code"
+                        ),
+                    },
+                    {"name": "writing-skills", "description": "(superpowers) ..."},
+                ]
+            },
+            mcp_status={},
+        )
+        msg, sources = await probe_skill(client_factory=lambda **_kw: client)
+        assert sources == ["user"]
+        assert msg.startswith("OK")
+
+    @pytest.mark.asyncio
+    async def test_finds_skill_via_prefixed_name_dict(self) -> None:
+        # Some plugins do report prefixed names (e.g., code-review:code-review).
+        client = _FakeClient(
+            server_info={
+                "commands": [
+                    {"name": "code-review:code-review", "description": "(code-review) ..."},
+                ]
+            },
+            mcp_status={},
+        )
+        msg, sources = await probe_skill(
+            client_factory=lambda **_kw: client,
+            skill_name="code-review:code-review",
+        )
+        assert sources == ["user"]
+        assert msg.startswith("OK")
+
+    @pytest.mark.asyncio
+    async def test_does_not_match_bare_name_with_wrong_plugin_tag(self) -> None:
+        # A plugin named "other" exposes a "writing-plans" skill — must not
+        # match a probe targeting "superpowers:writing-plans".
+        client = _FakeClient(
+            server_info={
+                "commands": [
+                    {"name": "writing-plans", "description": "(other) Different plugin's skill"},
+                ]
+            },
+            mcp_status={},
+        )
+        with pytest.raises(PrereqFailedError):
+            await probe_skill(client_factory=lambda **_kw: client)
+
+    @pytest.mark.asyncio
     async def test_fails_when_skill_absent(self) -> None:
         client = _FakeClient(server_info={"commands": []}, mcp_status={})
         with pytest.raises(PrereqFailedError):

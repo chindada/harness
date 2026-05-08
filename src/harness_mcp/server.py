@@ -92,6 +92,21 @@ def _map_harness_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+# ---------- claude CLI resolver ----------
+
+
+def _resolve_claude_cli() -> str | None:
+    """Return the user's PATH `claude` so the SDK doesn't fall back to its bundled binary.
+
+    The SDK ships a `_bundled/claude` and prefers it over PATH. That bundled install
+    has no plugins, so probing for plugin-provided skills (e.g., superpowers:writing-plans)
+    reports them missing. Setting cli_path on ClaudeAgentOptions bypasses the bundled
+    choice. Returns None if `claude` isn't on PATH; the SDK then falls back to its own
+    resolver (no regression for users who never had `claude` on PATH anyway).
+    """
+    return shutil.which("claude")
+
+
 # ---------- options factories ----------
 
 
@@ -110,6 +125,7 @@ def _make_planner_options_factory(
             mcp_servers=cast(Any, {"context7": prereqs_result.captured_mcp["context7"]}),
             extra_args={"strict-mcp-config": None},
             permission_mode="acceptEdits",
+            cli_path=_resolve_claude_cli(),
         )
 
     return _factory
@@ -130,6 +146,7 @@ def _make_reviewer_options_factory(
             mcp_servers=cast(Any, {"context7": prereqs_result.captured_mcp["context7"]}),
             extra_args={"strict-mcp-config": None},
             permission_mode="acceptEdits",
+            cli_path=_resolve_claude_cli(),
         )
 
     return _factory
@@ -158,6 +175,7 @@ def _make_evaluator_options_factory(
             mcp_servers=cast(Any, {"context7": prereqs_result.captured_mcp["context7"]}),
             extra_args={"strict-mcp-config": None},
             permission_mode="acceptEdits",
+            cli_path=_resolve_claude_cli(),
         )
 
     return _factory
@@ -176,6 +194,7 @@ def _make_summarizer_options_factory(prereqs_result: PrereqsResult) -> Callable[
             mcp_servers=cast(Any, {"context7": prereqs_result.captured_mcp["context7"]}),
             extra_args={"strict-mcp-config": None},
             permission_mode="acceptEdits",
+            cli_path=_resolve_claude_cli(),
         )
 
     return _factory
@@ -203,7 +222,8 @@ def _client_factory(**kw: Any) -> Any:  # noqa: ANN401
         ClaudeSDKClient,
     )
 
-    options = ClaudeAgentOptions(**kw) if kw else ClaudeAgentOptions()
+    kw.setdefault("cli_path", _resolve_claude_cli())
+    options = ClaudeAgentOptions(**kw)
     return ClaudeSDKClient(options=options)
 
 

@@ -14,6 +14,7 @@ Module-level imports:
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, cast
@@ -92,6 +93,8 @@ async def _run(payload: dict[str, Any]) -> int:
         mcp_servers=cast(Any, {name: dict(stanza) for name, stanza in captured_mcp.items()}),
         extra_args={"strict-mcp-config": None},
         permission_mode="bypassPermissions",
+        # Override the SDK's bundled-CLI default; mirrors server._resolve_claude_cli().
+        cli_path=shutil.which("claude"),
     )
 
     with anyio.fail_after(max_eval_seconds):

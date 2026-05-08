@@ -240,6 +240,12 @@ async def probe_skill(
 
     Returns (status_message, resolved_setting_sources). resolved_setting_sources
     is recorded as `_resolved_setting_sources` for spawn calls (spec §10.1).
+
+    Matching handles two formats `get_server_info` returns for plugin commands:
+      * Prefixed name: ``{"name": "code-review:code-review", ...}``
+      * Bare name + plugin tag in description: ``{"name": "writing-plans",
+        "description": "(superpowers) ..."}``
+    Plus a legacy substring fallback for SDK builds that return strings.
     """
     sources = ["user"]
     client = client_factory(setting_sources=sources)
@@ -250,7 +256,20 @@ async def probe_skill(
             break  # drain one message; some clients hang otherwise
         info = await c.get_server_info()
     commands = info.get("commands") or []
-    if any(skill_name in str(cmd) for cmd in commands):
+
+    plugin_name, _, skill_local = skill_name.partition(":")
+
+    def _matches(cmd: Any) -> bool:  # noqa: ANN401
+        if isinstance(cmd, dict):
+            name = cmd.get("name", "")
+            desc = cmd.get("description", "")
+            if name == skill_name:
+                return True
+            if skill_local and name == skill_local and f"({plugin_name})" in desc:
+                return True
+        return skill_name in str(cmd)
+
+    if any(_matches(cmd) for cmd in commands):
         return f"OK skill: {skill_name} found at setting_sources={sources}", sources
     raise PrereqFailedError(
         f"skill {skill_name} not available at setting_sources={sources}; "
