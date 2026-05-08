@@ -538,7 +538,7 @@ class FakeCodex:
     async def thread_start(self) -> FakeCodex:
         return self
 
-    async def turn(self, _input: object) -> FakeTurn:
+    async def turn(self, _input: object, **_kw: object) -> FakeTurn:
         # Materialize the handoff file, then return scripted events.
         i = self.chunk_idx
         events = self.scripted_events_per_chunk[i]
@@ -590,7 +590,7 @@ class TestChunkLoop:
         @asynccontextmanager
         async def fake_async_codex(*_a: object, **_kw: object) -> AsyncIterator[object]:
             class _Thread:
-                async def turn(self, _input: object) -> FakeTurn:
+                async def turn(self, _input: object, **_kw: object) -> FakeTurn:
                     # Codex would have written code in cwd=app_repo.
                     (app_repo / "x.py").write_text("print('hi')\n", encoding="utf-8")
                     # Codex would also have written its handoff in the sprint dir.
@@ -639,7 +639,7 @@ class TestChunkLoop:
         @asynccontextmanager
         async def fake_async_codex(*_a: object, **_kw: object) -> AsyncIterator[object]:
             class _T:
-                async def turn(self, _input: object) -> FakeTurn:
+                async def turn(self, _input: object, **_kw: object) -> FakeTurn:
                     # Always write an in-progress handoff. Loop never converges.
                     handoff_path = sprint_dir / f"handoff-{chunk_idx[0] + 1:03d}.md"
                     handoff_path.write_text(GOOD_HANDOFF, encoding="utf-8")
@@ -684,7 +684,7 @@ class TestChunkLoop:
         @asynccontextmanager
         async def fake_async_codex(*_a: object, **_kw: object) -> AsyncIterator[object]:
             class _T:
-                async def turn(self, _input: object) -> FakeTurn:
+                async def turn(self, _input: object, **_kw: object) -> FakeTurn:
                     # Codex wrote real work into the repo this chunk.
                     (app_repo / "salvage.py").write_text("ok\n", encoding="utf-8")
                     # Write a deliberately MALFORMED handoff: status block has
@@ -754,7 +754,7 @@ class TestChunkLoop:
         @asynccontextmanager
         async def fake_async_codex(*_a: object, **_kw: object) -> AsyncIterator[object]:
             class _T:
-                async def turn(self, _input: object) -> object:
+                async def turn(self, _input: object, **_kw: object) -> object:
                     # Pre-write an in-progress handoff so chunk_loop continues
                     # to the next chunk after this stream breaks.
                     (sprint_dir / f"handoff-{chunk_idx[0] + 1:03d}.md").write_text(
@@ -843,7 +843,7 @@ class TestChunkLoop:
         @asynccontextmanager
         async def fake_async_codex(*_a: object, **_kw: object) -> AsyncIterator[object]:
             class _T:
-                async def turn(self, _input: object) -> object:
+                async def turn(self, _input: object, **_kw: object) -> object:
                     (sprint_dir / f"handoff-{chunk_idx[0] + 1:03d}.md").write_text(
                         GOOD_HANDOFF, encoding="utf-8"
                     )

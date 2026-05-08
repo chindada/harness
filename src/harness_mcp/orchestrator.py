@@ -21,6 +21,7 @@ from typing import Any
 import anyio
 
 from harness_mcp.config import JobOptions, jobs_root, now_ms
+from harness_mcp.phase_broker import PhaseBroker
 from harness_mcp.planning import PlanPhaseFailed, run_plan_phase
 from harness_mcp.prereqs import PrereqsResult
 from harness_mcp.prompts_loader import _resolved_prompt_text
@@ -36,6 +37,38 @@ from harness_mcp.summarizer import run_summarizer
 from harness_mcp.types import UnknownJobError
 
 _cancel_scopes: dict[str, anyio.CancelScope] = {}
+
+
+async def _write_phase(
+    *,
+    job_id: str,
+    phase: str,
+    broker: PhaseBroker,
+    sprints_completed: int | None = None,
+    status: str = "running",
+) -> None:
+    """Update jobs.current_phase + commit, then publish to the broker.
+
+    Status defaults to 'running' for normal phase transitions. Pass terminal
+    statuses ('completed' / 'failed' / 'cancelled') to record terminal state;
+    the broker will await-send terminal events so they're never dropped.
+
+    Note: callers that need additional column writes (last_message,
+    error_text, finished_at, plan_review_rounds) keep doing those as their
+    own db_write calls — _write_phase only handles the phase/status pair.
+    """
+    await db_write(
+        "UPDATE jobs SET current_phase=?, status=?, updated_at=? WHERE id=?",
+        (phase, status, now_ms(), job_id),
+    )
+    await broker.publish(
+        job_id,
+        {
+            "current_phase": phase,
+            "status": status,
+            "sprints_completed": sprints_completed,
+        },
+    )
 _scopes_lock = anyio.Lock()
 
 
@@ -167,6 +200,7 @@ async def run_job(
     evaluator_options_factory: Callable[..., Any],
     summarizer_options_factory: Callable[..., Any],
     codex_bin: str,
+    phase_broker: PhaseBroker,
 ) -> None:
     """Top-level per-job coroutine. Drives planning -> sprints -> summary.
 
@@ -187,6 +221,10 @@ async def run_job(
             )
             if rc == 0:
                 return  # cancel beat us
+            await phase_broker.publish(
+                job_id,
+                {"current_phase": "planning", "status": "running", "sprints_completed": None},
+            )
 
             # Plan phase.
             generator_md = _resolved_prompt_text("generator.md")
@@ -194,9 +232,8 @@ async def run_job(
             async def _set_plan_phase(phase: str) -> None:
                 # Spec §4.4: every plan-phase transition mirrors into the jobs
                 # row so poll_build reports the live phase.
-                await db_write(
-                    "UPDATE jobs SET current_phase=?, updated_at=? WHERE id=?",
-                    (phase, now_ms(), job_id),
+                await _write_phase(
+                    job_id=job_id, phase=phase, broker=phase_broker, sprints_completed=None
                 )
 
             sprints, plan_review_rounds = await run_plan_phase(
@@ -225,9 +262,11 @@ async def run_job(
             # Sprint loop.
             prior_tag: str | None = None
             for seq, title in sprints:
-                await db_write(
-                    "UPDATE jobs SET current_phase=?, updated_at=? WHERE id=?",
-                    (f"sprint-{seq}/contract", now_ms(), job_id),
+                await _write_phase(
+                    job_id=job_id,
+                    phase=f"sprint-{seq}/contract",
+                    broker=phase_broker,
+                    sprints_completed=seq - 1,
                 )
                 await db_write(
                     "UPDATE sprints SET status='running', started_at=? WHERE job_id=? AND seq=?",
@@ -236,9 +275,8 @@ async def run_job(
 
                 async def _set_sprint_phase(phase: str) -> None:
                     # Spec §4.4:277-280 — sprint sub-phase transitions.
-                    await db_write(
-                        "UPDATE jobs SET current_phase=?, updated_at=? WHERE id=?",
-                        (phase, now_ms(), job_id),
+                    await _write_phase(
+                        job_id=job_id, phase=phase, broker=phase_broker, sprints_completed=seq - 1
                     )
 
                 result = await run_sprint(
@@ -280,14 +318,24 @@ async def run_job(
                             job_id,
                         ),
                     )
+                    await phase_broker.publish(
+                        job_id,
+                        {
+                            "current_phase": f"sprint-{seq}/retry",
+                            "status": "failed",
+                            "sprints_completed": seq - 1,
+                        },
+                    )
                     return
 
                 prior_tag = f"harness/{job_id}/sprint-{seq}"
 
             # Summarizer.
-            await db_write(
-                "UPDATE jobs SET current_phase='summarizing', updated_at=? WHERE id=?",
-                (now_ms(), job_id),
+            await _write_phase(
+                job_id=job_id,
+                phase="summarizing",
+                broker=phase_broker,
+                sprints_completed=len(sprints),
             )
             summarizer_options = summarizer_options_factory(job_dir=job_dir)
             summary = await run_summarizer(job_dir=job_dir, options=summarizer_options)
@@ -299,6 +347,14 @@ async def run_job(
                 # caps prose at 2-3 sentences, so no truncation is needed.
                 (summary, now_ms(), now_ms(), job_id),
             )
+            await phase_broker.publish(
+                job_id,
+                {
+                    "current_phase": "done",
+                    "status": "completed",
+                    "sprints_completed": len(sprints),
+                },
+            )
         except anyio.get_cancelled_exc_class():
             # Cancellation: the cancel_job handler already wrote the terminal row.
             with anyio.CancelScope(shield=True), anyio.move_on_after(15):
@@ -307,6 +363,20 @@ async def run_job(
                     "('completed','failed','cancelled','interrupted')",
                     (now_ms(), job_id),
                 )
+                # Read the (already-written-by-cancel_job) status to publish it.
+                async with open_reader() as r:
+                    row = r.execute(
+                        "SELECT current_phase, status FROM jobs WHERE id=?", (job_id,)
+                    ).fetchone()
+                if row is not None:
+                    await phase_broker.publish(
+                        job_id,
+                        {
+                            "current_phase": row[0],
+                            "status": row[1],
+                            "sprints_completed": None,
+                        },
+                    )
             raise
         except PlanPhaseFailed as e:
             # Spec §5.1:320 / §5.2:327 / §5.2:343 — fail with the phase the
@@ -320,6 +390,10 @@ async def run_job(
                     "('completed','failed','cancelled','interrupted')",
                     (e.phase, e.error_text, now_ms(), now_ms(), job_id),
                 )
+                await phase_broker.publish(
+                    job_id,
+                    {"current_phase": e.phase, "status": "failed", "sprints_completed": None},
+                )
         except Exception as e:
             with anyio.CancelScope(shield=True), anyio.move_on_after(15):
                 await db_write(
@@ -328,5 +402,19 @@ async def run_job(
                     "('completed','failed','cancelled','interrupted')",
                     (f"orchestrator_error: {e!r}", now_ms(), now_ms(), job_id),
                 )
+                # current_phase is whatever it was — read it back for the event.
+                async with open_reader() as r:
+                    row = r.execute(
+                        "SELECT current_phase FROM jobs WHERE id=?", (job_id,)
+                    ).fetchone()
+                await phase_broker.publish(
+                    job_id,
+                    {
+                        "current_phase": row[0] if row else "unknown",
+                        "status": "failed",
+                        "sprints_completed": None,
+                    },
+                )
         finally:
             await unregister_scope(job_id)
+            phase_broker.close(job_id)

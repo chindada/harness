@@ -22,6 +22,7 @@ from harness_mcp.orchestrator import (
     start_orchestrator_inserts_row,
     unregister_scope,
 )
+from harness_mcp.phase_broker import PhaseBroker
 from harness_mcp.planning import PlanPhaseFailed
 from harness_mcp.prereqs import PrereqsResult
 from harness_mcp.server import poll_build
@@ -228,6 +229,7 @@ class TestRunJobCASRace:
             evaluator_options_factory=lambda **_kw: object(),
             summarizer_options_factory=lambda **_kw: object(),
             codex_bin="codex",
+            phase_broker=PhaseBroker(),
         )
 
         # The CAS UPDATE matched zero rows; the orchestrator returned
@@ -282,6 +284,7 @@ class TestRunJobPlanPhaseFailed:
             evaluator_options_factory=lambda **_kw: object(),
             summarizer_options_factory=lambda **_kw: object(),
             codex_bin="codex",
+            phase_broker=PhaseBroker(),
         )
 
         async with open_reader() as r:
@@ -323,6 +326,7 @@ class TestRunJobPlanPhaseFailed:
             evaluator_options_factory=lambda **_kw: object(),
             summarizer_options_factory=lambda **_kw: object(),
             codex_bin="codex",
+            phase_broker=PhaseBroker(),
         )
 
         async with open_reader() as r:
@@ -378,6 +382,7 @@ class TestLastMessagePopulated:
             evaluator_options_factory=lambda **_kw: object(),
             summarizer_options_factory=lambda **_kw: object(),
             codex_bin="codex",
+            phase_broker=PhaseBroker(),
         )
 
         # poll_build must surface the summary in last_message.
@@ -484,6 +489,7 @@ class TestSprintRowWriteShielded:
             evaluator_options_factory=lambda **_kw: object(),
             summarizer_options_factory=lambda **_kw: object(),
             codex_bin="codex",
+            phase_broker=PhaseBroker(),
         )
 
         # First: verify the SHIELDED sprint UPDATE was actually attempted.
@@ -505,3 +511,53 @@ class TestSprintRowWriteShielded:
         assert row[0] == "passed"
         assert row[1] == 0
         assert row[2] is not None  # finished_at written
+
+
+class TestRunJobPhaseBroker:
+    """run_job publishes a phase event for every current_phase / status transition."""
+
+    @pytest.mark.asyncio
+    async def test_publishes_planning_and_terminal_failed(
+        self, db: Path, monkeypatch: pytest.MonkeyPatch, tmp_harness_home: Path
+    ) -> None:
+        from harness_mcp.phase_broker import PhaseBroker
+
+        await db_write(
+            "INSERT INTO jobs (id, status, current_phase, design_path, options_json, "
+            "started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("J_BROKER", "pending", "init", "/x", "{}", 1, 1),
+        )
+        (tmp_harness_home / "jobs" / "J_BROKER").mkdir()
+
+        async def fake_plan_phase(**_kw: Any) -> None:
+            raise PlanPhaseFailed("synthetic failure", phase="planning")
+
+        monkeypatch.setattr(_orch_module, "run_plan_phase", fake_plan_phase)
+
+        broker = PhaseBroker()
+        sub = broker.subscribe("J_BROKER")
+
+        await run_job(
+            job_id="J_BROKER",
+            options=JobOptions(),
+            prereqs_result=_empty_prereqs(),
+            planner_options_factory=lambda **_kw: object(),
+            reviewer_options_factory=lambda **_kw: object(),
+            evaluator_options_factory=lambda **_kw: object(),
+            summarizer_options_factory=lambda **_kw: object(),
+            codex_bin="codex",
+            phase_broker=broker,
+        )
+
+        received: list[dict] = []
+        async with sub:
+            async for event in sub:
+                received.append(event)
+
+        phases = [e["current_phase"] for e in received]
+        statuses = [e["status"] for e in received]
+        # CAS pending→running emits 'planning'; PlanPhaseFailed emits final 'failed'.
+        assert phases[0] == "planning"
+        assert statuses[0] == "running"
+        assert statuses[-1] == "failed"
+        assert phases[-1] == "planning"  # PlanPhaseFailed carries phase='planning'

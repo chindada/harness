@@ -18,10 +18,11 @@ from functools import partial
 from pathlib import Path
 from typing import Any, cast
 
+import anyio
 from anyio import create_task_group
 from anyio.abc import TaskGroup
 from mcp import types as mcp_types
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 from harness_mcp.config import JobOptions, jobs_root
 from harness_mcp.orchestrator import (
@@ -29,6 +30,7 @@ from harness_mcp.orchestrator import (
     run_job,
     start_orchestrator_inserts_row,
 )
+from harness_mcp.phase_broker import PhaseBroker
 from harness_mcp.prereqs import (
     DoctorReport,
     PrereqsResult,
@@ -229,6 +231,7 @@ class ServerState:
     prereqs_result: PrereqsResult
     codex_bin: str
     task_group: TaskGroup
+    phase_broker: PhaseBroker
 
 
 _state: ServerState | None = None
@@ -273,7 +276,12 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:
         report=report,
     )
     async with create_task_group() as tg:
-        _state = ServerState(prereqs_result=prereqs_result, codex_bin=codex_bin, task_group=tg)
+        _state = ServerState(
+                prereqs_result=prereqs_result,
+                codex_bin=codex_bin,
+                task_group=tg,
+                phase_broker=PhaseBroker(),
+            )
         try:
             yield
         finally:
@@ -281,6 +289,45 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:
 
 
 server = FastMCP("harness-mcp", lifespan=lifespan)
+
+
+async def _kickoff_build(
+    design_doc_path: str, options: dict[str, Any] | None
+) -> tuple[str, JobOptions]:
+    """Validate inputs, insert pending jobs row, schedule run_job. Return (job_id, options).
+
+    Shared between start_build (fire-and-forget) and run_build (blocking).
+    """
+    p = Path(design_doc_path)
+    if not p.is_file() or p.stat().st_size == 0:  # noqa: ASYNC240
+        raise DesignDocNotFoundError(design_doc_path)
+    job_options = JobOptions.from_dict(options)
+
+    job_id = await start_orchestrator_inserts_row(design_doc_path=p, options=job_options)
+
+    assert _state is not None
+    job_dir = jobs_root() / job_id
+    _state.task_group.start_soon(
+        partial(
+            run_job,
+            job_id=job_id,
+            options=job_options,
+            prereqs_result=_state.prereqs_result,
+            planner_options_factory=_make_planner_options_factory(
+                _state.prereqs_result, job_dir=job_dir
+            ),
+            reviewer_options_factory=_make_reviewer_options_factory(
+                _state.prereqs_result, job_dir=job_dir
+            ),
+            evaluator_options_factory=_make_evaluator_options_factory(
+                _state.prereqs_result, job_dir=job_dir
+            ),
+            summarizer_options_factory=_make_summarizer_options_factory(_state.prereqs_result),
+            codex_bin=_state.codex_bin,
+            phase_broker=_state.phase_broker,
+        )
+    )
+    return job_id, job_options
 
 
 @server.tool()
@@ -312,36 +359,47 @@ async def start_build(
         >>> await start_build("/abs/path/to/design.md", {"max_sprints": 5})
         {"job_id": "01HC..."}
     """
-    p = Path(design_doc_path)
-    if not p.is_file() or p.stat().st_size == 0:  # noqa: ASYNC240
-        raise DesignDocNotFoundError(design_doc_path)
-    job_options = JobOptions.from_dict(options)
-
-    job_id = await start_orchestrator_inserts_row(design_doc_path=p, options=job_options)
-
-    assert _state is not None
-    job_dir = jobs_root() / job_id
-    # anyio.TaskGroup.start_soon takes only positional args; bind keywords with partial.
-    _state.task_group.start_soon(
-        partial(
-            run_job,
-            job_id=job_id,
-            options=job_options,
-            prereqs_result=_state.prereqs_result,
-            planner_options_factory=_make_planner_options_factory(
-                _state.prereqs_result, job_dir=job_dir
-            ),
-            reviewer_options_factory=_make_reviewer_options_factory(
-                _state.prereqs_result, job_dir=job_dir
-            ),
-            evaluator_options_factory=_make_evaluator_options_factory(
-                _state.prereqs_result, job_dir=job_dir
-            ),
-            summarizer_options_factory=_make_summarizer_options_factory(_state.prereqs_result),
-            codex_bin=_state.codex_bin,
-        )
-    )
+    job_id, _ = await _kickoff_build(design_doc_path, options)
     return {"job_id": job_id}
+
+
+@server.tool()
+@_map_harness_errors
+async def run_build(
+    design_doc_path: str,
+    options: dict[str, Any] | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Start a build and block until terminal. Streams progress notifications.
+
+    Returns the same payload as get_build_result, plus job_id so the caller
+    has a handle for poll_build / get_build_result if anything goes sideways.
+    """
+    assert _state is not None
+    job_id, _ = await _kickoff_build(design_doc_path, options)
+    subscriber = _state.phase_broker.subscribe(job_id)
+
+    if ctx is not None:
+        await ctx.report_progress(0, None, f"starting (job_id={job_id})")
+
+    try:
+        async with subscriber:
+            async for event in subscriber:
+                if ctx is not None:
+                    await ctx.report_progress(
+                        event.get("sprints_completed") or 0,
+                        None,
+                        f"{event['current_phase']} (status={event['status']})",
+                    )
+                if event["status"] in TERMINAL_JOB_STATUSES:
+                    break
+    except anyio.get_cancelled_exc_class():
+        await cancel_job(job_id)
+        raise
+
+    result = await get_build_result(job_id)
+    result["job_id"] = job_id
+    return result
 
 
 @server.tool()
