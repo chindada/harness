@@ -41,20 +41,23 @@ class TestCheckPathsAndDb:
 
 
 class TestCheckEnv:
-    def test_passes_when_anthropic_key_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_returns_ok_when_anthropic_key_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-...")
-        msg = check_env()
-        assert msg.startswith("OK")
+        status, msg = check_env()
+        assert status == "OK"
+        assert "ANTHROPIC_API_KEY" in msg
 
-    def test_fails_when_key_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_returns_warn_when_key_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        with pytest.raises(PrereqFailedError):
-            check_env()
+        status, msg = check_env()
+        assert status == "WARN"
+        assert "Claude Code CLI auth" in msg
 
-    def test_fails_when_key_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_returns_warn_when_key_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ANTHROPIC_API_KEY", "")
-        with pytest.raises(PrereqFailedError):
-            check_env()
+        status, msg = check_env()
+        assert status == "WARN"
+        assert "Claude Code CLI auth" in msg
 
 
 class TestCheckCodexBinary:
@@ -147,13 +150,15 @@ class TestSweepAtStartup:
 
 
 class TestDoctorReport:
-    def test_formats_passes_and_fails(self) -> None:
+    def test_formats_passes_warns_and_fails(self) -> None:
         report = DoctorReport()
         report.add("paths", "OK", "~/.harness exists; state.db at ~/.harness/state.db")
-        report.add("env", "FAIL", "ANTHROPIC_API_KEY missing")
+        report.add("env", "WARN", "ANTHROPIC_API_KEY not set; relying on Claude Code CLI auth")
+        report.add("codex", "FAIL", "binary not found")
         out = format_doctor_report(report)
         assert "OK   paths" in out
-        assert "FAIL env" in out
+        assert "WARN env" in out
+        assert "FAIL codex" in out
 
 
 class TestProbeCodexSdkShape:

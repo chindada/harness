@@ -54,7 +54,12 @@ class DoctorReport:
 def format_doctor_report(report: DoctorReport) -> str:
     lines = []
     for name, status, detail in report.rows:
-        marker = "OK  " if status == "OK" else "FAIL"
+        if status == "OK":
+            marker = "OK  "
+        elif status == "WARN":
+            marker = "WARN"
+        else:
+            marker = "FAIL"
         lines.append(f"{marker} {name}: {detail}")
     return "\n".join(lines)
 
@@ -90,11 +95,15 @@ async def check_paths_and_db() -> str:
     return f"OK paths: home={home}; state_db={state_db_path()}"
 
 
-def check_env() -> str:
+def check_env() -> tuple[str, str]:
     key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        raise PrereqFailedError("ANTHROPIC_API_KEY not set or empty")
-    return "OK env: ANTHROPIC_API_KEY is set"
+    if key:
+        return "OK", "env: ANTHROPIC_API_KEY is set"
+    return (
+        "WARN",
+        "env: ANTHROPIC_API_KEY not set; relying on Claude Code CLI auth "
+        "(keychain or ~/.claude/.credentials.json). Verify with 'claude auth status'.",
+    )
 
 
 def check_codex_binary() -> str:
@@ -359,8 +368,8 @@ async def run_prereqs(
     msg = await check_paths_and_db()
     report.add("paths_and_db", "OK", msg)
 
-    msg = check_env()
-    report.add("env", "OK", msg)
+    status, msg = check_env()
+    report.add("env", status, msg)
 
     msg = check_codex_binary()
     report.add("codex_binary", "OK", msg)

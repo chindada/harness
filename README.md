@@ -38,8 +38,8 @@ An MCP server that orchestrates multi-hour, multi-agent application builds from 
    **Streamable-http** (daemon — jobs survive client disconnects). Use for multi-hour builds.
 
    ```bash
-   # 1. Start the daemon (needs ANTHROPIC_API_KEY in env):
-   ANTHROPIC_API_KEY=... harness-mcp serve --transport streamable-http --host 127.0.0.1 --port 8765
+   # 1. Start the daemon:
+   harness-mcp serve --transport streamable-http --host 127.0.0.1 --port 8765
 
    # 2. In another terminal, register the URL with Claude Code:
    claude mcp add --scope user --transport http harness-mcp http://127.0.0.1:8765/mcp
@@ -76,10 +76,10 @@ For streamable-http, point a `url` field at the daemon (see step 4 above for the
 
 | Var                 | Required | Purpose                                                                 |
 | ------------------- | -------- | ----------------------------------------------------------------------- |
-| `ANTHROPIC_API_KEY` | yes      | Used by Planner / Reviewer / Evaluator / Summarizer (Claude Agent SDK). |
+| `ANTHROPIC_API_KEY` | no       | Used by Planner / Reviewer / Evaluator / Summarizer (Claude Agent SDK). |
 | `HARNESS_CODEX_BIN` | no       | Override `which codex`. Useful when codex isn't on PATH.                |
 
-(Codex auth lives in `~/.codex/auth.json`; no `OPENAI_API_KEY` needed.)
+(Codex auth lives in `~/.codex/auth.json`; no `OPENAI_API_KEY` needed. If `ANTHROPIC_API_KEY` is unset, the Claude Agent SDK falls back to Claude Code CLI auth — system keychain on macOS, or `~/.claude/.credentials.json` on Linux/Windows. Verify with `claude auth status`.)
 
 ## Required MCP servers
 
