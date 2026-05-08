@@ -30,10 +30,7 @@ from codex_app_server import TextInput as _TextInput
 
 from harness_mcp import __version__
 from harness_mcp.config import harness_home, jobs_root, state_db_path
-from harness_mcp.mcp_capture import (
-    capture_from_mcp_status,
-    parse_user_config_files,
-)
+from harness_mcp.mcp_capture import parse_user_config_files
 from harness_mcp.state import init_db, sweep_running_to_interrupted
 
 
@@ -323,56 +320,24 @@ async def probe_skill(
 
 async def probe_mcp_servers(
     *,
-    client_factory: Callable[..., Any],
     project_root: Path | None,
 ) -> tuple[str, dict[str, dict[str, Any]]]:
-    """Capture context7 (hard) + playwright (soft) MCP server stanzas.
+    """Capture context7 (hard) + playwright (soft) MCP server stanzas from disk.
 
-    Strategy:
-      1. Open ClaudeSDKClient -> get_mcp_status() - read inline `config` if present.
-      2. For names without inline config but `connected`, fall back to
-         parsing user config files via mcp_capture.parse_user_config_files.
-      3. context7 missing -> PrereqFailedError. playwright missing -> warning.
-
-    Plugin-provided MCP servers are reported by the SDK as
-    ``plugin:<plugin>:<server>`` (e.g., ``plugin:playwright:playwright``);
-    we treat the plugin-prefixed form of playwright as an alias for the bare
-    name so downstream consumers see a canonical key.
+    File-based capture only. Does NOT spawn a probe claude. A spawned claude
+    would load every user-scope MCP — including harness-mcp itself (recursive
+    lifespan) and the playwright plugin (npx + chromium) — cascading into a
+    fork bomb at startup. parse_user_config_files reads the same stanzas
+    directly from ~/.claude.json, project .mcp.json, and plugin caches, which
+    is sufficient for capture; we don't need a live "is it currently connected"
+    signal here, only the stanza to forward to spawned agents later.
     """
-    # SDK alias for the plugin-provided playwright MCP. Hardcoded because
-    # playwright is the only plugin we currently care about; if more arrive,
-    # generalize to a small alias map.
-    playwright_plugin_name = "plugin:playwright:playwright"
-
-    client = client_factory()
-    async with client as c:
-        await c.query("ready?")
-        async for _ in c.receive_response():
-            break
-        status = await c.get_mcp_status()
-
-    want = ("context7", "playwright", playwright_plugin_name)
-    captured = capture_from_mcp_status(status, want=want)
-    # Normalize plugin-form playwright to canonical name.
-    if playwright_plugin_name in captured:
-        captured.setdefault("playwright", captured.pop(playwright_plugin_name))
-
-    missing_with_inline: list[str] = []
-    for e in status.get("mcpServers", []) or []:
-        raw = e.get("name")
-        if raw not in want or e.get("status") != "connected":
-            continue
-        canonical = "playwright" if raw == playwright_plugin_name else raw
-        if canonical not in captured:
-            missing_with_inline.append(canonical)
-    if missing_with_inline:
-        captured.update(
-            parse_user_config_files(tuple(missing_with_inline), project_root=project_root)
-        )
+    want = ("context7", "playwright")
+    captured = parse_user_config_files(want, project_root=project_root)
 
     if "context7" not in captured:
         raise PrereqFailedError(
-            "context7 MCP server not connected or not configured. "
+            "context7 MCP server not configured. "
             "Add a context7 stanza to ~/.claude.json mcpServers."
         )
 
@@ -459,9 +424,7 @@ async def run_prereqs(
     skill_msg, sources = await probe_skill(client_factory=client_factory)
     report.add("skill", "OK", skill_msg)
 
-    mcp_msg, captured = await probe_mcp_servers(
-        client_factory=client_factory, project_root=project_root
-    )
+    mcp_msg, captured = await probe_mcp_servers(project_root=project_root)
     report.add("mcp", "OK", mcp_msg)
 
     strict_msg = await assert_strict_mcp_config_works(

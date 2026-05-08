@@ -116,15 +116,23 @@ def parse_user_config_files(  # noqa: PLR0912, PLR0915 — sequence of distinct 
 
     plugin_cache = home / ".claude" / "plugins" / "cache"
     if plugin_cache.is_dir():
-        # 4. Plugin-shipped .mcp.json files.
+        # 4. Plugin-shipped .mcp.json files. Two shapes seen in the wild:
+        #    wrapped {"mcpServers": {<name>: <stanza>}} (matches project
+        #    .mcp.json) and flat {<name>: <stanza>} (the playwright plugin
+        #    cache uses this). Accept either; _ingest only picks up names in
+        #    `want`, so flat files with unrelated top-level keys are harmless.
         for mcp_json in plugin_cache.rglob(".mcp.json"):
             try:
                 data = json.loads(mcp_json.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 continue
+            if not isinstance(data, dict):
+                continue
             servers = data.get("mcpServers")
             if isinstance(servers, dict):
                 _ingest(servers)
+            else:
+                _ingest(data)
         # 5. Inline mcpServers inside each plugin's plugin.json (rarer, but supported
         #    by Claude Code per current docs).
         for plugin_json in plugin_cache.rglob(".claude-plugin/plugin.json"):

@@ -235,7 +235,17 @@ _state: ServerState | None = None
 
 
 def _client_factory(**kw: Any) -> Any:  # noqa: ANN401
-    """Default client factory passed to prereqs probes."""
+    """Default client factory for prereq probes — isolated by default.
+
+    Defaults `extra_args={"strict-mcp-config": None}` and `mcp_servers={}` so
+    spawned claudes don't load the user's MCP servers. Critical because
+    harness-mcp itself is typically registered at user scope; without isolation,
+    each probe spawn re-launches harness-mcp (recursive lifespan) plus every
+    other user MCP (e.g., the playwright plugin's `npx @playwright/mcp@latest`),
+    cascading into a fork bomb at startup. Callers that legitimately need an
+    MCP (e.g., assert_strict_mcp_config_works needs context7) override by
+    passing `mcp_servers` explicitly.
+    """
     from claude_agent_sdk import (  # type: ignore[import-untyped]  # noqa: PLC0415
         ClaudeAgentOptions,
         ClaudeSDKClient,
@@ -243,7 +253,10 @@ def _client_factory(**kw: Any) -> Any:  # noqa: ANN401
 
     kw.setdefault("cli_path", _resolve_claude_cli())
     kw.setdefault("env", _claude_env_overrides())
-    options = ClaudeAgentOptions(**kw)
+    kw.setdefault("mcp_servers", {})
+    extra_args = dict(kw.pop("extra_args", None) or {})
+    extra_args.setdefault("strict-mcp-config", None)
+    options = ClaudeAgentOptions(**kw, extra_args=extra_args)
     return ClaudeSDKClient(options=options)
 
 

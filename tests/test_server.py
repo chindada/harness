@@ -9,6 +9,7 @@ import pytest
 from mcp import types as mcp_types
 
 from harness_mcp.server import (
+    _client_factory,
     _to_call_tool_error,
     cancel_build,
     get_build_result,
@@ -22,6 +23,30 @@ from harness_mcp.types import (
     JobNotFinishedError,
     UnknownJobError,
 )
+
+
+class TestClientFactoryDefaults:
+    """Regression: probe spawns must be MCP-isolated.
+
+    Without strict-mcp-config + empty mcp_servers, the spawned claude loads the
+    user's full MCP set — which includes harness-mcp itself (recursive lifespan)
+    and plugin MCPs like playwright (npx + chromium). That cascades into a fork
+    bomb at startup; the parent Claude Code reports `harness-mcp: failed`.
+    """
+
+    def test_defaults_to_strict_mcp_config_and_empty_mcp_servers(self) -> None:
+        client = _client_factory()
+        opts = client.options
+        assert opts.mcp_servers == {}
+        assert opts.extra_args == {"strict-mcp-config": None}
+
+    def test_caller_can_override_mcp_servers_for_legitimate_probes(self) -> None:
+        # assert_strict_mcp_config_works needs context7 to verify the flag works.
+        client = _client_factory(mcp_servers={"context7": {"command": "ctx7"}})
+        opts = client.options
+        assert opts.mcp_servers == {"context7": {"command": "ctx7"}}
+        # strict-mcp-config still applied so only the explicit servers load.
+        assert opts.extra_args == {"strict-mcp-config": None}
 
 
 class TestErrorMapper:

@@ -456,56 +456,74 @@ class TestProbeSkill:
             await probe_skill(client_factory=lambda **_kw: client)
 
 
+def _write_user_claude_json(home: Path, mcp_servers: dict[str, Any]) -> None:
+    """Drop a minimal ~/.claude.json into a tmp HOME for the file-based capture."""
+    import json as _json
+
+    (home / ".claude.json").write_text(
+        _json.dumps({"mcpServers": mcp_servers}), encoding="utf-8"
+    )
+
+
 class TestProbeMcpServers:
     @pytest.mark.asyncio
-    async def test_captures_context7_via_inline_config(self) -> None:
-        client = _FakeClient(
-            server_info={},
-            mcp_status={
-                "mcpServers": [
-                    {"name": "context7", "status": "connected", "config": {"command": "ctx7"}},
-                ]
-            },
-        )
-        msg, captured = await probe_mcp_servers(
-            client_factory=lambda **_kw: client, project_root=None
-        )
-        assert "context7" in captured
+    async def test_captures_context7_from_user_claude_json(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("HARNESS_CLAUDE_CONFIG_DIR", raising=False)
+        _write_user_claude_json(tmp_path, {"context7": {"command": "ctx7"}})
+
+        msg, captured = await probe_mcp_servers(project_root=None)
         assert captured["context7"] == {"command": "ctx7"}
         assert msg.startswith("OK")
 
     @pytest.mark.asyncio
-    async def test_fails_when_context7_disconnected_no_files(
+    async def test_fails_when_context7_absent(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("HOME", str(tmp_path))
-        client = _FakeClient(
-            server_info={},
-            mcp_status={
-                "mcpServers": [
-                    {"name": "context7", "status": "disconnected"},
-                ]
-            },
-        )
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("HARNESS_CLAUDE_CONFIG_DIR", raising=False)
+        # No .claude.json on disk -> nothing to capture.
         with pytest.raises(PrereqFailedError):
-            await probe_mcp_servers(client_factory=lambda **_kw: client, project_root=tmp_path)
+            await probe_mcp_servers(project_root=None)
 
     @pytest.mark.asyncio
-    async def test_playwright_soft_warns_when_missing(self) -> None:
-        client = _FakeClient(
-            server_info={},
-            mcp_status={
-                "mcpServers": [
-                    {"name": "context7", "status": "connected", "config": {"command": "ctx7"}},
-                ]
-            },
-        )
-        msg, captured = await probe_mcp_servers(
-            client_factory=lambda **_kw: client, project_root=None
-        )
-        _ = msg
+    async def test_playwright_soft_warns_when_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("HARNESS_CLAUDE_CONFIG_DIR", raising=False)
+        _write_user_claude_json(tmp_path, {"context7": {"command": "ctx7"}})
+
+        msg, captured = await probe_mcp_servers(project_root=None)
         assert "playwright" not in captured
-        # No exception raised - playwright is soft.
+        assert "playwright absent" in msg
+
+    @pytest.mark.asyncio
+    async def test_picks_up_playwright_from_plugin_cache(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import json as _json
+
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.delenv("HARNESS_CLAUDE_CONFIG_DIR", raising=False)
+        _write_user_claude_json(tmp_path, {"context7": {"command": "ctx7"}})
+
+        plugin_dir = tmp_path / ".claude" / "plugins" / "cache" / "playwright" / "x"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / ".mcp.json").write_text(
+            _json.dumps({"playwright": {"command": "npx", "args": ["@playwright/mcp@latest"]}}),
+            encoding="utf-8",
+        )
+
+        msg, captured = await probe_mcp_servers(project_root=None)
+        assert captured["playwright"] == {"command": "npx", "args": ["@playwright/mcp@latest"]}
+        assert "playwright absent" not in msg
 
 
 class TestAssertStrictMcpConfigWorks:
