@@ -22,10 +22,10 @@ An MCP server that orchestrates multi-hour, multi-agent application builds from 
 3. Install harness-mcp with uv:
 
    ```bash
-   uv pip install -e .
+   uv tool install --editable .
    ```
 
-   First-time install pulls the Codex SDK from a git dependency, so it takes longer than a typical `uv pip install`.
+   `uv tool install` puts `harness-mcp` on your PATH at `~/.local/bin/` so Claude Code (and your shell) can spawn it. `--editable` keeps it linked to the checkout — source changes are live without reinstall. First-time install pulls the Codex SDK from a git dependency, so it takes longer than a typical install. If `~/.local/bin` isn't already on `PATH`, run `uv tool update-shell` after install.
 
 4. Register harness-mcp with Claude Code. Pick one transport.
 

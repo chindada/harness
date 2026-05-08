@@ -55,10 +55,12 @@ One-line note immediately after: the editable install in step 3 pulls the Codex 
 ### 3.3 Step 3 — Install harness-mcp
 
 > ```bash
-> uv pip install -e .
+> uv tool install --editable .
 > ```
 
 The current README's `uv pip install harness-mcp` line is dropped; see §4.
+
+**Why `uv tool install` and not `uv pip install -e .`** (correction applied 2026-05-08 after dogfooding): `uv pip install -e .` installs the `harness-mcp` console script into the project's `.venv/bin/`, which is not on a typical user's PATH. The user's shell can't find `harness-mcp` (so step 5's `harness-mcp doctor` fails with `command not found`), and — more critically — when Claude Code spawns the registered stdio MCP server later, it inherits the user's shell PATH and also can't find the binary. `uv tool install` puts the executable in `~/.local/share/uv/tools/<pkg>/bin/` and symlinks it into `~/.local/bin/`, which is on PATH for typical macOS/Linux setups. `--editable` preserves live-source-changes during development. If `~/.local/bin/` isn't on PATH, `uv tool update-shell` adds it to common shell rc files.
 
 ### 3.4 Step 4 — Register with Claude Code
 
