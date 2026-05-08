@@ -225,21 +225,45 @@ async def probe_codex_sdk_shape() -> tuple[str, tuple[str, ...]]:
                 client_title="Harness Probe",
                 client_version=__version__,
             )
+            saw_tool_call = False
             try:
                 async with _AsyncCodex(config=cfg) as codex:
                     thread = await codex.thread_start()
+                    # Imperative shell-command prompt — natural-language "write a
+                    # file" doesn't reliably trigger tool use across codex backends
+                    # (e.g., gpt-5-3-codex via Azure text-replies "Done" without
+                    # invoking any tool). Explicit "Run this shell command"
+                    # consistently triggers the shell tool on every backend tested.
                     turn = await thread.turn(
-                        _TextInput("write a file called probe.txt containing the word ok and exit")
+                        _TextInput("Run this shell command exactly: echo ok > probe.txt")
                     )
-                    async for _event in turn.stream():
-                        pass
+                    async for event in turn.stream():
+                        # Track whether the model actually invoked a shell command;
+                        # CommandExecutionThreadItem is codex_app_server's marker for
+                        # an executed shell tool. Without this, we can't distinguish
+                        # "sandbox blocked the write" from "model never called a tool".
+                        payload = getattr(event, "payload", None)
+                        item = getattr(payload, "item", None)
+                        root = getattr(item, "root", None) if item is not None else None
+                        if root is not None and type(root).__name__ == "CommandExecutionThreadItem":
+                            saw_tool_call = True
             except Exception as e:
                 last_error = f"override {form!r} raised {e!r}"
                 continue
 
             if (tmp_dir / "probe.txt").is_file():
                 return (f"OK codex-shape: accepted overrides {form}", form)
-            last_error = f"override {form!r} accepted but probe.txt not written"
+            if not saw_tool_call:
+                last_error = (
+                    f"override {form!r} accepted but model invoked no shell command "
+                    "(model didn't attempt the write — check codex backend's tool-use "
+                    "behavior; e.g., gpt-5-3-codex may text-reply without calling tools)"
+                )
+            else:
+                last_error = (
+                    f"override {form!r} accepted, model ran a shell command, "
+                    "but probe.txt not written (sandbox blocked the write)"
+                )
 
     raise PrereqFailedError(
         "Codex sandbox override accepted but no form actually permitted writes. "

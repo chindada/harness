@@ -7,8 +7,8 @@ An MCP server that orchestrates multi-hour, multi-agent application builds from 
 1. Install the Codex CLI (<https://github.com/openai/codex>), confirm `codex --version` works, then configure `~/.codex/config.toml` — at minimum set your model. Example:
 
    ```toml
-   model = "claude-sonnet-4-6"
-   model_provider = "anthropic"
+   model = "gpt-5-3-codex"
+   model_provider = "azure"
    ```
 
 2. Clone the repo:
